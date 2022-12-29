@@ -103,9 +103,9 @@ class NFLDataset(Dataset):
         base_dir = self._get_base_dir(game_play, view, id_1, id_2)
         for frame in frames:
             fname = f"{base_dir}_{frame}{self.config.extention}"
-            if not os.path.isfile(fname):
-                return False
-        return True
+            if os.path.isfile(fname):
+                return True
+        return False
 
     def _get_item_information(self, df: pd.DataFrame, logger: Logger):
         self.items = []
@@ -169,6 +169,13 @@ class NFLDataset(Dataset):
     def __len__(self):
         return len(self.items)
 
+    @staticmethod
+    def imread(path):
+        if os.path.isfile(path):
+            return cv2.imread(path)
+        else:
+            return None
+
     def __getitem__(self, index):
         item = self.items[index]  # {movie_id}/{start_time}
 
@@ -180,9 +187,17 @@ class NFLDataset(Dataset):
                                       item["id_1"],
                                       item["id_2"])
         if self.config.extention == ".jpg":
-            frames = np.stack([
-                cv2.imread(f"{base_dir}_{frame}.jpg") for frame in frames
-            ], axis=0).transpose(3, 0, 1, 2)  # shape = (C, n_frame, H, W)
+            imgs = [self.imread(f"{base_dir}_{frame}.jpg") for frame in frames]
+
+            # 外挿
+            first_img_idx = [i for i, img in enumerate(imgs) if img is not None][0]
+
+            for idx in range(first_img_idx):
+                imgs[idx] = imgs[first_img_idx].copy()
+            for i in range(len(imgs) - 1):
+                if imgs[i+1] is None:
+                    imgs[i+1] = imgs[i].copy()
+            frames = np.stack(imgs, axis=0).transpose(3, 0, 1, 2)  # shape = (C, n_frame, H, W)
 
         return contact_id.tolist(), torch.Tensor(frames), torch.Tensor(labels)
 
@@ -447,7 +462,7 @@ def main(config):
         shuffle=True,
         pin_memory=True,
         drop_last=True,
-        num_workers=4
+        num_workers=8
     )
 
     val_loader = DataLoader(
@@ -456,7 +471,7 @@ def main(config):
         shuffle=False,
         pin_memory=True,
         drop_last=False,
-        num_workers=4
+        num_workers=8
     )
 
     model = model.to(device)
@@ -555,19 +570,15 @@ if __name__ == "__main__":
     #         config = Config(exp_name=exp_name, n_predict_frames=n_predict_frames, n_frames=n_frames)
     #         main(config)
 
-    # image_path = "images_96x96_v2"
-    # exp_name = f"2d_1dcnn_3layers_GELU"
-    # config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU)
+    # image_path = "images_128x96"
+    # exp_name = f"2d_1dcnn_3layers_GELU_20221226img"
+    # config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
+    #                 base_dir="../../notebook/20221226", data_dir="../../notebook/20221226/data_v2", image_path=image_path)
     # main(config)
-
-    image_path = "images_96x96_v2"
-    exp_name = f"2d_1dcnn_3layers_GELU"
-    config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-                    data_dir=f"../../notebook/20221225/data_v2")
-    main(config)
 
     image_path = "images_128x96"
     exp_name = f"2d_1dcnn_3layers_GELU_20221226img"
     config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-                    base_dir="../../notebook/20221226", data_dir="../../notebook/20221225/data_v2", image_path=image_path)
+                    base_dir="../../notebook/20221226", data_dir="../../notebook/20221226/data_v2", image_path=image_path,
+                    negative_sample_ratio=0.05, epochs=2)
     main(config)

@@ -20,6 +20,7 @@ from sklearn.metrics import roc_auc_score, matthews_corrcoef, confusion_matrix
 import shutil
 import mlflow
 import torch.nn.functional as F
+from typing import Tuple
 
 torch.backends.cudnn.benchmark = True
 
@@ -44,9 +45,8 @@ class Config:
     exp_name: str
     debug: bool = False
 
+    epochs: int = 1
     if debug:
-        epochs: int = 1
-    else:
         epochs: int = 1
 
     lr: float = 1e-4
@@ -56,11 +56,14 @@ class Config:
     if n_frames % 2 == 0 or n_predict_frames % 2 == 0:
         raise ValueError
     step: int = 2
-    extention: str = ".jpg"
+    extention: str = ".npy"
     negative_sample_ratio: float = 0.2
-    base_dir: str = "../../notebook/20221214"
-    data_dir: str = f"../../notebook/20221214/data_v2"
+    base_dir: str = "../../output/preprocess/images"
+    data_dir: str = f"../../output/preprocess/master_data"
     image_path: str = "images_96x96_v2"
+    img_shape: Tuple[int, int] = (96, 128)
+    gradient_clipping: float = 0.1
+    exist_image_threshold: float = 0.5
 
     # 2d_cnn
     model_name_2d: str = "tf_efficientnet_b0_ns"
@@ -71,7 +74,6 @@ class Config:
     kernel_size_conv1d: int = 3
     stride_conv1d: int = 1
     hidden_size_1d: int = 32
-
 
 
 class NFLDataset(Dataset):
@@ -96,14 +98,35 @@ class NFLDataset(Dataset):
 
     def _exist_files(self,
                      game_play: str,
-                     view: str,
                      id_1: str,
                      id_2: str,
                      frames: List[int]):
-        base_dir = self._get_base_dir(game_play, view, id_1, id_2)
+        count = 0
+
+        for view in ["Sideline", "Endzone"]:
+            base_dir = self._get_base_dir(game_play, view, id_1, id_2)
+            for frame in frames:
+                fname = f"{base_dir}_{frame}{self.config.extention}"
+                if os.path.isfile(fname):
+                    count += 1
+                if count > self.config.n_frames * 2 * self.config.exist_image_threshold:
+                    return True
+        return False
+
+    def _exist_center_files(self,
+                            game_play: str,
+                            id_1: str,
+                            id_2: str,
+                            frames: List[int]):
+        # 予測対象のframeはSideline / Endline どっちかにはファイルがいてほしい
         for frame in frames:
-            fname = f"{base_dir}_{frame}{self.config.extention}"
-            if not os.path.isfile(fname):
+            ret = False
+            for view in ["Sideline", "Endzone"]:
+                base_dir = self._get_base_dir(game_play, view, id_1, id_2)
+                fname = f"{base_dir}_{frame}{self.config.extention}"
+                if os.path.isfile(fname):
+                    ret = True
+            if not ret:
                 return False
         return True
 
@@ -114,54 +137,50 @@ class NFLDataset(Dataset):
         failed_count = 0
         np.random.seed(0)
 
-        for key, w_df in tqdm.tqdm(df.groupby(["game_play", "view", "nfl_player_id_1", "nfl_player_id_2"])):
+        for key, w_df in tqdm.tqdm(df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])):
             game_play = key[0]
-            view = key[1]
-            id_1 = key[2]
-            id_2 = key[3]
+            id_1 = key[1]
+            id_2 = key[2]
+            w_df = w_df.reset_index(drop=True)
 
             contact_ids = w_df["contact_id"].values
             frames = w_df["frame"].values
             contacts = w_df["contact"].values
             distances = w_df["distance"].values
-            ranks = w_df["rank"].values
 
-            rank_1_indices = np.where(ranks == 1)[0]
-
-            for idx, i in enumerate(rank_1_indices):
-                min_frame_idx = i - self.config.n_frames // 2 * self.config.step
-                max_frame_idx = i + self.config.n_frames // 2 * self.config.step + 1  # frames数は偶数にする(conv1dメンドイので)
-                if min_frame_idx < 0 or max_frame_idx >= len(w_df):
+            for i in range(len(w_df)):
+                min_frame_idx = frames[i] - self.config.n_frames // 2 * self.config.step
+                max_frame_idx = frames[i] + self.config.n_frames // 2 * self.config.step + 1  # frames数は偶数にする(conv1dメンドイので)
+                if min_frame_idx < frames[0] or max_frame_idx >= frames[-1]:
                     continue
-                indice = np.arange(min_frame_idx, max_frame_idx, self.config.step)
+                frame_indice = np.arange(min_frame_idx, max_frame_idx, self.config.step)
                 window = self.config.n_predict_frames // 2
+
                 predict_frames_indice = np.arange(
-                    idx - window,
-                    idx + window + 1,
+                    i - window,
+                    i + window + 1,
                 )
-                predict_frames_indice = rank_1_indices[predict_frames_indice]
                 assert len(predict_frames_indice) == self.config.n_predict_frames
+                if distances[i] > 1.75:
+                    continue
 
                 if contacts[predict_frames_indice].sum() == 0 and np.random.random() > self.config.negative_sample_ratio and not self.test:
                     continue
 
-                if not self._exist_files(
-                    game_play=game_play,
-                    view=view,
-                    id_1=id_1,
-                    id_2=id_2,
-                    frames=frames[indice]
-                ):
+                if not self._exist_files(game_play=game_play, id_1=id_1, id_2=id_2, frames=frame_indice):
                     failed_count += 1
                     continue
+                # if not self._exist_center_files(game_play=game_play, id_1=id_1, id_2=id_2, frames=frames[predict_frames_indice]):
+                #     failed_count += 1
+                #     continue
+
                 self.items.append({
                     "contact_id": contact_ids[predict_frames_indice],
                     "game_play": game_play,
-                    "view": view,
                     "id_1": id_1,
                     "id_2": id_2,
                     "contact": contacts[predict_frames_indice],
-                    "frames": frames[indice]
+                    "frames": frame_indice
                 })
 
         logger.info(f"finished. extracted={len(self.items)} (total={len(df)}, failed: {failed_count})")
@@ -169,20 +188,43 @@ class NFLDataset(Dataset):
     def __len__(self):
         return len(self.items)
 
+    @staticmethod
+    def imread(path):
+        if os.path.isfile(path):
+            return np.load(path)
+        else:
+            return None
+
     def __getitem__(self, index):
         item = self.items[index]  # {movie_id}/{start_time}
 
         contact_id = item["contact_id"]
         frames = item["frames"]
         labels = item["contact"]
-        base_dir = self._get_base_dir(item["game_play"],
-                                      item["view"],
-                                      item["id_1"],
-                                      item["id_2"])
-        if self.config.extention == ".jpg":
-            frames = np.stack([
-                cv2.imread(f"{base_dir}_{frame}.jpg") for frame in frames
-            ], axis=0).transpose(3, 0, 1, 2)  # shape = (C, n_frame, H, W)
+
+        imgs_all = []
+        for view in ["Endzone", "Sideline"]:
+            base_dir = self._get_base_dir(item["game_play"],
+                                          view,
+                                          item["id_1"],
+                                          item["id_2"])
+            imgs = [self.imread(f"{base_dir}_{frame}.npy") for frame in frames]
+
+            # 外挿
+            first_img_idx = [i for i, img in enumerate(imgs) if img is not None]
+
+            if len(first_img_idx) == 0:
+                imgs_all.extend([np.zeros((self.config.img_shape[0], self.config.img_shape[1], 3)) for _ in range(len(imgs))])
+                continue
+            first_img_idx = first_img_idx[0]
+
+            for idx in range(first_img_idx):
+                imgs[idx] = imgs[first_img_idx].copy()
+            for i in range(len(imgs) - 1):
+                if imgs[i+1] is None:
+                    imgs[i+1] = imgs[i].copy()
+            imgs_all.extend(imgs)
+        frames = np.stack(imgs_all, axis=0).transpose(3, 0, 1, 2)  # shape = (C, n_frame*n_view, H, W)
 
         return contact_id.tolist(), torch.Tensor(frames), torch.Tensor(labels)
 
@@ -222,7 +264,7 @@ def train_fn(dataloader, model, criterion, optimizer, device, scheduler, epoch, 
             loss = criterion(pred.flatten(), label.flatten())
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clipping)
         scheduler.step()
         scaler.step(optimizer)
         scaler.update()
@@ -296,9 +338,9 @@ class ThreeLayerConv1DUnit(nn.Module):
         self.activation = config.activation()
 
     def forward(self, x):
-        x = self.activation(self.pl(self.do(F.relu(self.bn(self.fc(x))))))
-        x = self.activation(self.do2(F.relu(self.bn2(self.fc2(x)))))
-        x = self.activation(self.do3(F.relu(self.bn3(self.fc3(x)))))
+        x = self.pl(self.do(self.activation(self.bn(self.fc(x)))))
+        x = self.do2(self.activation(self.bn2(self.fc2(x))))
+        x = self.do3(self.activation(self.bn3(self.fc3(x))))
         return x
 
 
@@ -355,17 +397,19 @@ class Model(nn.Module):
         self.config = config
         self.cnn_2d = timm.create_model(config.model_name_2d, num_classes=0, pretrained=True)
         self.seq_model = SequenceModel(
-            hidden_size=self.cnn_2d.num_features,
+            hidden_size=self.cnn_2d.num_features*2,
             config=config
         )
         self.fc = nn.LazyLinear(config.n_predict_frames)
 
     def forward(self, x):
         bs, C, seq_len, W, H = x.shape
-        x = x.permute(0, 2, 1, 3, 4)  # (bs, seq_len, C, W, H)
-        x = x.reshape(bs*seq_len, C, W, H)  # (bs*seq_len, C, W, H)
-        x = self.cnn_2d(x)  # (bs*seq_len, features)
-        x = x.reshape(bs, seq_len, -1)  # (bs, seq_len, features)
+        x = x.permute(0, 2, 1, 3, 4)  # (bs, seq_len*n_view, C, W, H)
+        x = x.reshape(bs*seq_len, C, W, H)  # (bs*seq_len*n_view, C, W, H)
+        x = self.cnn_2d(x)  # (bs*seq_len*n_view, features)
+        x = x.reshape(bs, 2, seq_len//2, -1)  # (bs, n_view, seq_len, features)
+        x = x.permute(0, 2, 1, 3)  # (bs, seq_len, n_view, features)
+        x = x.reshape(bs, seq_len, -1)  # (bs, seq_len, n_view*features)
 
         x = self.seq_model(x)  # (bs, seq_len, features)
         x = x.mean(dim=2)  # (bs, seq_len)
@@ -447,7 +491,7 @@ def main(config):
         shuffle=True,
         pin_memory=True,
         drop_last=True,
-        num_workers=4
+        num_workers=8
     )
 
     val_loader = DataLoader(
@@ -456,7 +500,7 @@ def main(config):
         shuffle=False,
         pin_memory=True,
         drop_last=False,
-        num_workers=4
+        num_workers=8
     )
 
     model = model.to(device)
@@ -555,19 +599,34 @@ if __name__ == "__main__":
     #         config = Config(exp_name=exp_name, n_predict_frames=n_predict_frames, n_frames=n_frames)
     #         main(config)
 
-    # image_path = "images_96x96_v2"
-    # exp_name = f"2d_1dcnn_3layers_GELU"
-    # config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU)
-    # main(config)
-
-    image_path = "images_96x96_v2"
-    exp_name = f"2d_1dcnn_3layers_GELU"
+    image_path = "images_128x96"
+    exp_name = f"2d_1dcnn_3layers_GELU_20221226img"
     config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-                    data_dir=f"../../notebook/20221225/data_v2")
+                    image_path=image_path, exist_image_threshold=0.5)
     main(config)
 
     image_path = "images_128x96"
     exp_name = f"2d_1dcnn_3layers_GELU_20221226img"
     config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-                    base_dir="../../notebook/20221226", data_dir="../../notebook/20221225/data_v2", image_path=image_path)
+                    image_path=image_path, exist_image_threshold=0.1)
     main(config)
+
+    image_path = "images_128x96"
+    exp_name = f"2d_1dcnn_3layers_GELU_20221226img_neg0.05"
+    config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
+                    image_path=image_path, negative_sample_ratio=0.05, epochs=2)
+    main(config)
+
+    image_path = "images_128x96"
+    exp_name = f"2d_1dcnn_3layers_GELU_20221226img_neg0.05_gradclip1"
+    config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
+                    image_path=image_path, negative_sample_ratio=0.05, gradient_clipping=1)
+    main(config)
+
+    for step in [3, 4]:
+        image_path = "images_128x96"
+        exp_name = f"2d_1dcnn_3layers_GELU_20221226img_neg0.05_step{step}"
+        config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
+                        image_path=image_path, negative_sample_ratio=0.05, gradient_clipping=1,
+                        step=step)
+        main(config)

@@ -142,6 +142,8 @@ class NFLDataset(Dataset):
                 predict_frames_indice = rank_1_indices[predict_frames_indice]
                 assert len(predict_frames_indice) == self.config.n_predict_frames
 
+                if distances[predict_frames_indice].min() > 200:
+                    continue
                 if contacts[predict_frames_indice].sum() == 0 and np.random.random() > self.config.negative_sample_ratio and not self.test:
                     continue
 
@@ -447,7 +449,7 @@ def main(config):
         shuffle=True,
         pin_memory=True,
         drop_last=True,
-        num_workers=4
+        num_workers=8
     )
 
     val_loader = DataLoader(
@@ -456,7 +458,7 @@ def main(config):
         shuffle=False,
         pin_memory=True,
         drop_last=False,
-        num_workers=4
+        num_workers=8
     )
 
     model = model.to(device)
@@ -555,19 +557,7 @@ if __name__ == "__main__":
     #         config = Config(exp_name=exp_name, n_predict_frames=n_predict_frames, n_frames=n_frames)
     #         main(config)
 
-    # image_path = "images_96x96_v2"
-    # exp_name = f"2d_1dcnn_3layers_GELU"
-    # config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU)
-    # main(config)
-
     image_path = "images_96x96_v2"
     exp_name = f"2d_1dcnn_3layers_GELU"
-    config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-                    data_dir=f"../../notebook/20221225/data_v2")
-    main(config)
-
-    image_path = "images_128x96"
-    exp_name = f"2d_1dcnn_3layers_GELU_20221226img"
-    config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-                    base_dir="../../notebook/20221226", data_dir="../../notebook/20221225/data_v2", image_path=image_path)
+    config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU)
     main(config)

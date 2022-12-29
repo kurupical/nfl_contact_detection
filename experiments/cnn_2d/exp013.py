@@ -20,6 +20,7 @@ from sklearn.metrics import roc_auc_score, matthews_corrcoef, confusion_matrix
 import shutil
 import mlflow
 import torch.nn.functional as F
+from typing import Tuple
 
 torch.backends.cudnn.benchmark = True
 
@@ -61,6 +62,7 @@ class Config:
     base_dir: str = "../../notebook/20221214"
     data_dir: str = f"../../notebook/20221225/data_v2"
     image_path: str = "images_96x96_v2"
+    img_shape: Tuple[int, int] = (96, 96)
 
     # 2d_cnn
     model_name_2d: str = "tf_efficientnet_b0_ns"
@@ -78,12 +80,14 @@ class NFLDataset(Dataset):
     def __init__(self,
                  df: pd.DataFrame,
                  base_dir: str,
+                 player_dict: dict,
                  logger: Logger,
                  config: Config,
                  test: bool):
         self.base_dir = base_dir
         self.config = config
         self.test = test
+        self.player_dict = player_dict
         self.exist_files = set()
         self._get_item_information(df, logger)
 
@@ -114,77 +118,76 @@ class NFLDataset(Dataset):
         failed_count = 0
         np.random.seed(0)
 
-        for key, w_df in tqdm.tqdm(df.groupby(["game_play", "view", "nfl_player_id_1", "nfl_player_id_2"])):
+        df = df[(df["view"] == "Sideline") & (df["rank"] == 1)]  # viewは片方でok
+        for key, w_df in tqdm.tqdm(df.groupby(["game_play", "frame", "step"])):
+
             game_play = key[0]
-            view = key[1]
-            id_1 = key[2]
-            id_2 = key[3]
+            frame = key[1]
+            step = key[2]  # frameとstepは両方groupbyする意味はないが...
+            player_list = self.player_dict[f"{game_play}_{frame}"]
 
-            contact_ids = w_df["contact_id"].values
-            frames = w_df["frame"].values
+            player_idx_dict = {i, p for i, p in enumerate(player_list)}
+
+            contact_matrix = np.zeros((len(player_list), len(player_list)))
+
             contacts = w_df["contact"].values
-            distances = w_df["distance"].values
-            ranks = w_df["rank"].values
 
-            rank_1_indices = np.where(ranks == 1)[0]
+            id_1s = w_df["nfl_player_id_1"].values
+            id_2s = w_df["nfl_player_id_2"].values
 
-            for idx, i in enumerate(rank_1_indices):
-                min_frame_idx = i - self.config.n_frames // 2 * self.config.step
-                max_frame_idx = i + self.config.n_frames // 2 * self.config.step + 1  # frames数は偶数にする(conv1dメンドイので)
-                if min_frame_idx < 0 or max_frame_idx >= len(w_df):
+            for i in range(len(w_df)):
+                if contacts[i] == 0 and np.random.random() > self.config.negative_sample_ratio and not self.test:
                     continue
-                indice = np.arange(min_frame_idx, max_frame_idx, self.config.step)
-                window = self.config.n_predict_frames // 2
-                predict_frames_indice = np.arange(
-                    idx - window,
-                    idx + window + 1,
-                )
-                predict_frames_indice = rank_1_indices[predict_frames_indice]
-                assert len(predict_frames_indice) == self.config.n_predict_frames
+                id_1 = id_1s[i]
+                id_2 = id_2s[i]
+                if id_2 == "G":
+                    id_2 = id_1
+                contact_matrix[player_idx_dict[id_1, id_2]] = 1
+                contact_matrix[player_idx_dict[id_2, id_1]] = 1
 
-                if contacts[predict_frames_indice].sum() == 0 and np.random.random() > self.config.negative_sample_ratio and not self.test:
-                    continue
-
-                if not self._exist_files(
-                    game_play=game_play,
-                    view=view,
-                    id_1=id_1,
-                    id_2=id_2,
-                    frames=frames[indice]
-                ):
-                    failed_count += 1
-                    continue
-                self.items.append({
-                    "contact_id": contact_ids[predict_frames_indice],
-                    "game_play": game_play,
-                    "view": view,
-                    "id_1": id_1,
-                    "id_2": id_2,
-                    "contact": contacts[predict_frames_indice],
-                    "frames": frames[indice]
-                })
+            self.items.append({
+                "game_play": game_play,
+                "step": step,
+                "frame": frame,
+                "contact": contact_matrix,
+            })
 
         logger.info(f"finished. extracted={len(self.items)} (total={len(df)}, failed: {failed_count})")
 
     def __len__(self):
         return len(self.items)
 
+    def imread(self, img_path):
+        if os.path.isfile(img_path):
+            return cv2.imread(img_path)
+        else:
+            return np.zeros((3, self.config.img_shape[0], self.config.img_shape[1]))
+
     def __getitem__(self, index):
         item = self.items[index]  # {movie_id}/{start_time}
 
-        contact_id = item["contact_id"]
-        frames = item["frames"]
+        game_play = item["game_play"]
+        step = item["step"]
+        frame = item["frame"]
         labels = item["contact"]
-        base_dir = self._get_base_dir(item["game_play"],
-                                      item["view"],
-                                      item["id_1"],
-                                      item["id_2"])
-        if self.config.extention == ".jpg":
-            frames = np.stack([
-                cv2.imread(f"{base_dir}_{frame}.jpg") for frame in frames
-            ], axis=0).transpose(3, 0, 1, 2)  # shape = (C, n_frame, H, W)
+        player_list = self.player_dict[f"{game_play}_{frame}"]
 
-        return contact_id.tolist(), torch.Tensor(frames), torch.Tensor(labels)
+        contact_id_matrix = [[""] * 22] * 22
+        for i, p1 in enumerate(player_list):
+            for j, p2 in enumerate(player_list):
+                if p1 == p2:
+                    p2 = "G"
+                contact_id_matrix[i, j] = f"{game_play}_{step}_{p1}_{p2}"
+
+        imgs = []
+        for player_id in player_list:
+            for view in ["Endzone", "Sideline"]:
+                img_path = f"{self.base_dir}/{game_play}/{view}/{player_id}_{frame}.jpg"
+                imgs.append(self.imread(img_path))
+
+        frames = np.stack(imgs, axis=0).transpose(3, 0, 1, 2)  # shape = (C, n_frame, H, W)
+        return contact_id_matrix, torch.Tensor(frames), torch.Tensor(labels)
+
 
 class AverageMeter(object):
     def __init__(self):
@@ -354,9 +357,13 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.cnn_2d = timm.create_model(config.model_name_2d, num_classes=0, pretrained=True)
-        self.seq_model = SequenceModel(
-            hidden_size=self.cnn_2d.num_features,
-            config=config
+        encoder_layer = nn.TransformerEncoderLayer(d_model=self.cnn_2d.model_name_2d, nhead=8)
+        self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=2)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=config.model_name_2d,
+            num_heads=8,
+            bias=False,
+            batch_first=True
         )
         self.fc = nn.LazyLinear(config.n_predict_frames)
 
@@ -365,11 +372,12 @@ class Model(nn.Module):
         x = x.permute(0, 2, 1, 3, 4)  # (bs, seq_len, C, W, H)
         x = x.reshape(bs*seq_len, C, W, H)  # (bs*seq_len, C, W, H)
         x = self.cnn_2d(x)  # (bs*seq_len, features)
-        x = x.reshape(bs, seq_len, -1)  # (bs, seq_len, features)
+        x = x.reshape(bs, 2, seq_len//2, -1)  # (bs, 2, n_players, features)  2: Side/End
+        x = x.permute(0, 2, 1, 3)  # (bs, n_players, 2, features)
+        x = x.reshape(bs, seq_len//2, -1)  # (bs, n_players, features*2)
 
-        x = self.seq_model(x)  # (bs, seq_len, features)
-        x = x.mean(dim=2)  # (bs, seq_len)
-        x = self.fc(x)  # (bs, seq_len, n_predict_frames)
+        x = self.transformer(x)  # (bs, n_players, features*2)
+        _, x = self.attn(x, x, x)  # (bs, n_players, n_players)
         return x
 
 
