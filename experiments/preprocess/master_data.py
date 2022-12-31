@@ -51,6 +51,9 @@ def join_helmets_contact(game_play, labels, helmets, meta, view="Sideline", fps=
     gp["frame"] = gp["frame"].fillna(0).astype(int)
     gp = gp.drop(["datetime_ngs"], axis=1)
     gp = gp[gp["frame"].notnull()]
+
+    gp["game_play"] = gp["game_play"].fillna(game_play)
+    gp["view"] = gp["view"].fillna(view)
     return gp
 
 
