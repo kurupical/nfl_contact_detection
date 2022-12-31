@@ -63,11 +63,11 @@ class Config:
     image_path: str = "images_96x96_v2"
     img_shape: Tuple[int, int] = (96, 128)
     gradient_clipping: float = 1
-    exist_image_threshold: float = 0.5
+    exist_image_threshold: float = 0.1
 
     # 2d_cnn
-    model_name_2d: str = "tf_efficientnet_b0_ns"
-    seq_model: str = "1dcnn"
+    model_name: str = "cnn_3d_r3d_18"
+    seq_model: str = "flatten"
     dropout_seq: float = 0.2
     activation: nn.Module = nn.Identity
 
@@ -155,6 +155,8 @@ class NFLDataset(Dataset):
                 frame_indice = np.arange(min_frame_idx, max_frame_idx, self.config.step)
                 window = self.config.n_predict_frames // 2
 
+                if i - window < 0 or i + window + 1 > len(w_df):
+                    continue
                 predict_frames_indice = np.arange(
                     i - window,
                     i + window + 1,
@@ -294,6 +296,7 @@ def eval_fn(data_loader, model, criterion, device):
             contact_id = data[0]
             x = data[1].to(device)
             label = data[2].to(device)
+            label_len = label.shape[1]
 
             with torch.cuda.amp.autocast():
                 pred = model(x)
@@ -314,7 +317,7 @@ def eval_fn(data_loader, model, criterion, device):
     df_ret = pd.DataFrame({
         "contact_id": contact_ids,
         "score": preds,
-        "label": labels
+        "label": labels,
     })
     return df_ret, loss_score.avg
 
@@ -342,8 +345,6 @@ class ThreeLayerConv1DUnit(nn.Module):
         x = self.do3(self.activation(self.bn3(self.fc3(x))))
         return x
 
-
-
 class SequenceModel(nn.Module):
     def __init__(self,
                  hidden_size: int,
@@ -369,8 +370,7 @@ class SequenceModel(nn.Module):
                 dropout=self.config.dropout_seq
             )
         elif config.seq_model == "1dcnn":
-            self.model = nn.Conv1d(
-                in_channels=self.n_frames,
+            self.model = nn.LazyConv1d(
                 out_channels=self.n_frames,
                 kernel_size=config.kernel_size_conv1d,
                 stride=config.stride_conv1d,
@@ -394,7 +394,7 @@ class Model(nn.Module):
                  config: Config):
         super().__init__()
         self.config = config
-        self.cnn_2d = timm.create_model(config.model_name_2d, num_classes=0, pretrained=True)
+        self.cnn_2d = timm.create_model(config.model_name, num_classes=0, pretrained=True)
         self.seq_model = SequenceModel(
             hidden_size=self.cnn_2d.num_features*2,
             config=config
@@ -406,15 +406,47 @@ class Model(nn.Module):
         x = x.permute(0, 2, 1, 3, 4)  # (bs, seq_len*n_view, C, W, H)
         x = x.reshape(bs*seq_len, C, W, H)  # (bs*seq_len*n_view, C, W, H)
         x = self.cnn_2d(x)  # (bs*seq_len*n_view, features)
-        x = x.reshape(bs, 2, seq_len//2, -1)  # (bs, n_view, seq_len, features)
-        x = x.permute(0, 2, 1, 3)  # (bs, seq_len, n_view, features)
-        x = x.reshape(bs, seq_len, -1)  # (bs, seq_len, n_view*features)
+        x = x.reshape(bs, seq_len, -1)  # (bs, n_view*seq_len, features)
 
-        x = self.seq_model(x)  # (bs, seq_len, features)
-        x = x.mean(dim=2)  # (bs, seq_len)
-        x = self.fc(x)  # (bs, seq_len, n_predict_frames)
+        x = self.seq_model(x)  # (bs, n_view*seq_len, features)
+        x = x.mean(dim=2)  # (bs, n_view*seq_len)
+        x = self.fc(x)  # (bs, n_view*seq_len, n_predict_frames)
         return x
 
+class Model3D(nn.Module):
+    def __init__(self,
+                 config: Config):
+        super().__init__()
+        self.config = config
+        if self.config.model_name == "cnn_3d_r3d_18":
+            weights = R3D_18_Weights.DEFAULT
+            self.model = r3d_18(weights=weights)
+            self.model.fc = nn.Identity()
+        if self.config.seq_model == "1dcnn":
+            self.seq_model = nn.LazyConv1d(
+                out_channels=self.config.n_frames,
+                kernel_size=config.kernel_size_conv1d,
+                stride=config.stride_conv1d,
+                bias=False
+            )
+        self.fc = nn.LazyLinear(config.n_predict_frames)
+
+    def forward(self, x):
+        bs, C, seq_len, W, H = x.shape
+        x = x.permute(0, 2, 1, 3, 4)  # (bs, n_view*seq_len, C, W, H)
+        x = x.reshape(bs*2, seq_len//2, C, W, H)   # (bs*n_view, seq_len, C, W, H)
+        x = x.permute(0, 2, 1, 3, 4)
+        x = self.model(x)  # (bs*n_view, fc)
+        x = x.reshape(bs, 2, -1)  # (bs, 2, -1)
+        if self.config.seq_model == "flatten":
+            x = x.reshape(bs, -1)
+            x = self.fc(x)
+        elif self.config.seq_model == "1dcnn":
+            x = x.reshape(bs, 2, -1)  # (bs, 2, -1)
+            x = self.seq_model(x) # (bs, n_frames, -1)
+            x = x.mean(dim=2)
+            x = self.fc(x)
+        return x
 
 def get_df_from_item(item):
     df = pd.DataFrame({
@@ -440,7 +472,11 @@ def main(config):
     if config.debug:
         df_label = df_label.iloc[:150000]
 
-    model = Model(config=config)
+    if "cnn_3d" in config.model_name:
+        model = Model3D(config=config)
+    else:
+        model = Model(config=config)
+
 
     for train_idx, val_idx in gkfold.split(df_label, groups=df_label["game_play"].values):
         df_label_train = df_label.iloc[train_idx]
@@ -591,56 +627,35 @@ def main(config):
 
 if __name__ == "__main__":
 
-    # for n_frames in [31]:
-    #     for n_predict_frames in [1, 3, 5]:
-    #         image_path = "images_96x96_v2"
-    #         exp_name = f"2d_n_frames_{n_frames}, n_predict_frames{n_predict_frames}"
-    #         config = Config(exp_name=exp_name, n_predict_frames=n_predict_frames, n_frames=n_frames)
-    #         main(config)
-
     # image_path = "images_128x96"
-    # exp_name = f"2d_1dcnn_3layers_GELU_20221226img"
-    # config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-    #                 image_path=image_path, exist_image_threshold=0.5)
+    # exp_name = f"2d_1dcnn_simple_concat2side"
+    # config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn", activation=nn.GELU,
+    #                 image_path=image_path, gradient_clipping=1)
     # main(config)
     #
     # image_path = "images_128x96"
-    # exp_name = f"2d_1dcnn_3layers_GELU_20221226img"
+    # exp_name = f"2d_1dcnn_3layers_concat2side"
     # config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-    #                 image_path=image_path, exist_image_threshold=0.1)
+    #                 image_path=image_path, gradient_clipping=1)
     # main(config)
     #
-    # image_path = "images_128x96"
-    # exp_name = f"2d_1dcnn_3layers_GELU_20221226img_neg0.05"
-    # config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-    #                 image_path=image_path, negative_sample_ratio=0.05, epochs=2)
-    # main(config)
-    #
-    # image_path = "images_128x96"
-    # exp_name = f"2d_1dcnn_3layers_GELU_20221226img_neg0.05_gradclip1"
-    # config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-    #                 image_path=image_path, negative_sample_ratio=0.05, gradient_clipping=1)
-    # main(config)
-    #
-    # for step in [3, 4]:
+    # for seq_model in ["1dcnn", "flatten"]:
     #     image_path = "images_128x96"
-    #     exp_name = f"2d_1dcnn_3layers_GELU_20221226img_neg0.05_step{step}"
-    #     config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-    #                     image_path=image_path, negative_sample_ratio=0.05, gradient_clipping=1,
-    #                     step=step)
+    #     exp_name = f"3d_seq_model{seq_model}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model=seq_model,
+    #                     image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18")
     #     main(config)
 
-    step = 4
-    image_path = "images_128x96"
-    exp_name = f"2d_1dcnn_3layers_GELU_20221226img_neg0.05_step{step}"
-    config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-                    image_path=image_path, negative_sample_ratio=0.05, gradient_clipping=1,
-                    step=step)
-    main(config)
+    # for exist_image_threshold in [0.1, 0.25, 0.75, 0.9]:
+    #     image_path = "images_128x96"
+    #     exp_name = f"3d_n_exist_image_threshold{exist_image_threshold}"
+    #     config = Config(exp_name=exp_name, exist_image_threshold=exist_image_threshold, n_frames=31, seq_model="flatten",
+    #                     image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18")
+    #     main(config)
 
-    for exist_image_threshold in [0.25, 0.5, 0.75, 0.9]:
+    for step in [2, 4]:
         image_path = "images_128x96"
-        exp_name = f"2d_1dcnn_3layers_GELU_20221226img"
-        config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-                        image_path=image_path, exist_image_threshold=exist_image_threshold)
+        exp_name = f"3d_step{step}"
+        config = Config(exp_name=exp_name, step=step, n_frames=31, seq_model="flatten",
+                        image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18")
         main(config)
