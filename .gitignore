@@ -5,3 +5,4 @@ notebook/*
 .idea/
 util/watch_log/
 util/
+tools/watch_log/*.txt

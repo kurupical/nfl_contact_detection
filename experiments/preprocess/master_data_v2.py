@@ -31,11 +31,22 @@ def join_helmets_contact(game_play, labels, helmets, meta, view="Sideline", fps=
     gp_labs["datetime_ngs"] = pd.to_datetime(gp_labs["datetime"], utc=True)
 
     # TODO: helmetも player_1, player_2 ごとに抽出
+    helmet_columns = [
+        "frame", "datetime_ngs", "datetime", "view", "nfl_player_id", "left", "width", "top", "height",
+        "x", "y", "team"
+    ]
     gp = pd.merge(
-        gp_labs[["contact_id", "step", "nfl_player_id_1", "nfl_player_id_2", "datetime_ngs", "contact"]],
-        gp_helms,
-        right_on=["datetime_ngs", "nfl_player_id"],
-        left_on=["datetime_ngs", "nfl_player_id_1"],
+        gp_labs[["contact_id", "game_play", "step", "nfl_player_id_1", "nfl_player_id_2", "datetime_ngs", "contact"]],
+        gp_helms[helmet_columns].rename(
+            columns={col: f"{col}_1" if col not in ["frame", "datetime_ngs", "datetime", "view"] else col for col in helmet_columns}
+        ),
+        how="left",
+    )
+    gp = pd.merge(
+        gp,
+        gp_helms[helmet_columns].rename(
+            columns={col: f"{col}_2" if col not in ["frame", "datetime_ngs", "datetime", "view"] else col for col in helmet_columns}
+        ),
         how="left",
     )
     gp["diff"] = np.abs(gp["datetime"] - gp["datetime_ngs"])
@@ -50,7 +61,7 @@ def join_helmets_contact(game_play, labels, helmets, meta, view="Sideline", fps=
         gp_ret.append(gp_)
     gp = pd.concat(gp_ret)
     gp["frame"] = gp["frame"].fillna(0).astype(int)
-    gp = gp.drop(["datetime_ngs"], axis=1)
+    gp = gp.drop(["datetime_ngs", "diff", "rank"], axis=1)
     gp = gp[gp["frame"].notnull()]
 
     gp["game_play"] = gp["game_play"].fillna(game_play)
@@ -72,7 +83,7 @@ df_helmets["x"] = df_helmets["left"] + df_helmets["width"] / 2
 df_helmets["y"] = df_helmets["top"] + df_helmets["height"] / 2
 df_helmets["team"] = [x[0] for x in df_helmets["player_label"].values]
 df_tracking["nfl_player_id"] = df_tracking["nfl_player_id"].astype(str)
-game_plays = df_labels["game_play"].drop_duplicates().values[:3]
+game_plays = df_labels["game_play"].drop_duplicates().values
 
 df_helmets_concat = []
 for key, df_ in tqdm.tqdm(df_helmets.groupby(["game_play", "view", "nfl_player_id"])):
@@ -83,7 +94,7 @@ for key, df_ in tqdm.tqdm(df_helmets.groupby(["game_play", "view", "nfl_player_i
     nfl_player_id = key[2]
 
     df_ = pd.merge(
-        pd.DataFrame({"frame": np.arange(frame_min, frame_max + 1)}),
+        pd.DataFrame({"frame": np.arange(frame_min, frame_max + 1)}).astype(int),
         df_,
         how="left"
     )
@@ -109,21 +120,28 @@ for key, w_df_helms in tqdm.tqdm(df_helmets.groupby(["game_play", "view"])):
 
 gps = pd.concat(gps)
 
+tracking_columns = [
+    "game_play", "game_key", "nfl_player_id", "datetime", "step", "position", "x_position", "y_position",
+    "speed", "distance", "direction", "orientation", "acceleration", "sa"
+]
+key_columns = ["game_play", "datetime", "game_key", "step"]
 gps = pd.merge(
     gps,
-    df_tracking.rename(columns={col: f"{col}_1" if col not in ["game_play", "datetime", "game_key"] else col for col in df_tracking.columns}),
+    df_tracking[tracking_columns].rename(columns={col: f"{col}_1" if col not in key_columns else col for col in tracking_columns}),
     how="left"
 )
 gps = pd.merge(
     gps,
-    df_tracking.rename(columns={col: f"{col}_2" if col not in ["game_play", "datetime", "game_key"] else col for col in df_tracking.columns}),
+    df_tracking[tracking_columns].rename(columns={col: f"{col}_2" if col not in key_columns else col for col in tracking_columns}),
     how="left"
 )
 
-gps["distance_between_2players"] = np.sqrt(
+gps["distance"] = np.sqrt(
     (gps["x_position_1"].values - gps["x_position_2"]) ** 2 + (gps["y_position_1"].values - gps["y_position_2"]) ** 2
 )
 
-output_dir = "../../output/preprocess/master_data/"
+print(gps.isnull().sum() / len(gps))
+gps["frame"] = gps["frame"].fillna(99999).astype(int)
+output_dir = "../../output/preprocess/master_data_v2/"
 os.makedirs(output_dir, exist_ok=True)
 gps.reset_index(drop=True).to_feather(f"{output_dir}/gps.feather")

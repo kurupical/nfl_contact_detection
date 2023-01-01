@@ -48,7 +48,7 @@ def get_logger(output_dir=None, logging_level=logging.INFO):
 @dataclasses.dataclass
 class Config:
     exp_name: str
-    debug: bool = True
+    debug: bool = False
 
     epochs: int = 1
     if debug:
@@ -65,10 +65,16 @@ class Config:
     negative_sample_ratio: float = 0.05
     base_dir: str = "../../output/preprocess/images"
     data_dir: str = f"../../output/preprocess/master_data"
-    image_path: str = "images_96x96_v2"
+    image_path: str = "images_128x96"
     img_shape: Tuple[int, int] = (96, 128)
     gradient_clipping: float = 1
     exist_image_threshold: float = 0.1
+    data_per_epoch: float = 1
+    grayscale: bool = False
+    batch_size: int = 32
+    use_data_ratio: float = 1
+
+    num_training_steps: int = 100000
 
     # 2d_cnn
     model_name: str = "cnn_3d_r3d_18"
@@ -168,7 +174,6 @@ class NFLDataset(Dataset):
         logger.info("_get_item_information start")
 
         failed_count = 0
-        np.random.seed(0)
 
         contacts_all = []
         for key, w_df in tqdm.tqdm(df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])):
@@ -181,8 +186,12 @@ class NFLDataset(Dataset):
             frames = w_df["frame"].values
             contacts = w_df["contact"].values
             distances = w_df["distance"].values
+            np.random.seed(0)
 
             for i in range(len(w_df)):
+                if not self.test and np.random.random() > self.config.use_data_ratio:
+                    continue
+
                 min_frame_idx = frames[i] - self.config.n_frames // 2 * self.config.step
                 max_frame_idx = frames[i] + self.config.n_frames // 2 * self.config.step + 1  # frames数は偶数にする(conv1dメンドイので)
 
@@ -229,14 +238,18 @@ class NFLDataset(Dataset):
         key = self._get_key(game_play, view, id_1, id_2, frame)
         if self.image_dict is None:
             if os.path.isfile(key):
-                return np.load(key)
+                img = np.load(key)
             else:
                 return None
         else:
             if key in self.image_dict:
-                return self.image_dict[key]
+                img = self.image_dict[key]
             else:
                 return None
+        if self.config.grayscale:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)[:, :, np.newaxis]
+            img = np.concatenate([img, img, img], axis=2)
+        return img
 
     def __getitem__(self, index):
         item = self.items[index]  # {movie_id}/{start_time}
@@ -291,10 +304,14 @@ def train_fn(dataloader, model, criterion, optimizer, device, scheduler, epoch, 
     model.train()
     loss_score = AverageMeter()
 
-    tk0 = tqdm.tqdm(enumerate(dataloader), total=len(dataloader))
+    data_length = int(len(dataloader) * config.data_per_epoch)
+    tk0 = tqdm.tqdm(enumerate(dataloader), total=data_length)
 
     scaler = torch.cuda.amp.GradScaler()
+    count = 0
+    loss_100 = []
     for bi, data in tk0:
+        count += 1
         batch_size = len(data)
 
         x = data[1].to(device)
@@ -311,12 +328,20 @@ def train_fn(dataloader, model, criterion, optimizer, device, scheduler, epoch, 
         scaler.step(optimizer)
         scaler.update()
 
-        loss_score.update(loss.detach().item(), batch_size)
+        loss = loss.detach().item()
+        loss_100.append(loss)
+        loss_100 = loss_100[-100:]
+        loss_score.update(np.mean(loss_100), batch_size)
         mlflow.log_metric("train_loss", loss_score.avg)
+        mlflow.log_metric("train_loss_snap", np.mean(loss_100))
 
         tk0.set_postfix(Loss=loss_score.avg,
+                        LossSnap=np.mean(loss_100),
                         Epoch=epoch,
                         LR=optimizer.param_groups[0]['lr'])
+
+        if count > data_length:
+            break
 
     return loss_score.avg
 
@@ -571,7 +596,7 @@ def main(config):
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=32,
+        batch_size=config.batch_size,
         shuffle=True,
         pin_memory=True,
         drop_last=True,
@@ -580,7 +605,7 @@ def main(config):
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=32,
+        batch_size=config.batch_size,
         shuffle=False,
         pin_memory=True,
         drop_last=False,
@@ -590,11 +615,12 @@ def main(config):
     model = model.to(device)
     optimizer = torch.optim.Adam(params=model.parameters(), lr=config.lr)
     criterion = nn.BCEWithLogitsLoss()
-    scheduler = get_linear_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=50, num_training_steps=100000)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer=optimizer, num_warmup_steps=50, num_training_steps=config.num_training_steps
+    )
 
     results = []
     mlflow.set_tracking_uri('../../mlruns/')
-
 
     try:
         with mlflow.start_run(run_name=config.exp_name):
@@ -677,36 +703,46 @@ def main(config):
 
 if __name__ == "__main__":
 
-    # image_path = "images_128x96"
-    # exp_name = f"2d_1dcnn_simple_concat2side"
-    # config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn", activation=nn.GELU,
-    #                 image_path=image_path, gradient_clipping=1)
-    # main(config)
-    #
-    # image_path = "images_128x96"
-    # exp_name = f"2d_1dcnn_3layers_concat2side"
-    # config = Config(exp_name=exp_name, n_predict_frames=1, n_frames=31, seq_model="1dcnn_3layers", activation=nn.GELU,
-    #                 image_path=image_path, gradient_clipping=1)
-    # main(config)
-    #
-    # for seq_model in ["1dcnn", "flatten"]:
+    # for negative_sample_ratio in [0.05, 0.2, 0.5]:
     #     image_path = "images_128x96"
-    #     exp_name = f"3d_seq_model{seq_model}"
-    #     config = Config(exp_name=exp_name, n_frames=31, seq_model=seq_model,
-    #                     image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18")
+    #     exp_name = f"3d_negative_sample_ratio{negative_sample_ratio}"
+    #     config = Config(exp_name=exp_name, negative_sample_ratio=negative_sample_ratio, n_frames=31, seq_model="flatten",
+    #                     image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18", epochs=4)
+    #     main(config)
+    #
+    # for num_training_steps in [5000, 25000]:
+    #     image_path = "images_128x96"
+    #     exp_name = f"3d_num_training_steps{num_training_steps}"
+    #     config = Config(exp_name=exp_name, num_training_steps=num_training_steps, n_frames=31, seq_model="flatten",
+    #                     image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18", data_per_epoch=1)
+    #     main(config)
+    #
+    # for negative_sample_ratio in [0.2, 0.5]:
+    #     image_path = "images_128x96"
+    #     exp_name = f"3d_negative_sample_ratio{negative_sample_ratio}"
+    #     config = Config(exp_name=exp_name, negative_sample_ratio=negative_sample_ratio, n_frames=31, seq_model="flatten",
+    #                     image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18", epochs=4)
     #     main(config)
 
-    # for exist_image_threshold in [0.1, 0.25, 0.75, 0.9]:
-    #     image_path = "images_128x96"
-    #     exp_name = f"3d_n_exist_image_threshold{exist_image_threshold}"
-    #     config = Config(exp_name=exp_name, exist_image_threshold=exist_image_threshold, n_frames=31, seq_model="flatten",
-    #                     image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18")
+    # exp_name = f"3d_model_glayscale"
+    # config = Config(exp_name=exp_name, grayscale=True, seq_model="flatten", model_name="cnn_3d_r3d_18")
+    # main(config)
+
+    # for model_name in ["resnet10t", "resnet18"]:
+    #     exp_name = f"2d_model_{model_name}"
+    #     config = Config(exp_name=exp_name, grayscale=True, seq_model="1dcnn", model_name=model_name)
     #     main(config)
+    #
+    # for use_data_ratio in [0.25, 0.5]:
+    #     for negative_sample_ratio in [0.2, 0.5]:
+    #         exp_name = f"3d_model_use_data_ratio{use_data_ratio}, negative_sample_ratio{negative_sample_ratio}"
+    #         config = Config(exp_name=exp_name, grayscale=True, seq_model="flatten", model_name="cnn_3d_r3d_18",
+    #                         use_data_ratio=use_data_ratio, negative_sample_ratio=negative_sample_ratio)
+    #         main(config)
 
-    image_path = "images_128x96"
-    exp_name = f"master_data_v2"
-    config = Config(exp_name=exp_name,  n_frames=31, seq_model="flatten",
-                    image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18",
-                    data_dir=f"../../output/preprocess/master_data_v2")
-    main(config)
-
+    for use_data_ratio in [0.5]:
+        for negative_sample_ratio in [0.2, 0.5]:
+            exp_name = f"3d_model_use_data_ratio{use_data_ratio}, negative_sample_ratio{negative_sample_ratio}"
+            config = Config(exp_name=exp_name, grayscale=True, seq_model="flatten", model_name="cnn_3d_r3d_18",
+                            use_data_ratio=use_data_ratio, negative_sample_ratio=negative_sample_ratio)
+            main(config)
