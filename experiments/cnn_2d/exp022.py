@@ -55,6 +55,7 @@ class Config:
         epochs: int = 1
 
     lr: float = 1e-4
+    weight_decay: float = 0.001
     n_frames: int = 31
     n_predict_frames: int = 1
 
@@ -62,7 +63,8 @@ class Config:
         raise ValueError
     step: int = 3
     extention: str = ".npy"
-    negative_sample_ratio: float = 0.05
+    negative_sample_ratio_close: float = 0.05
+    negative_sample_ratio_far: float = 0.05
     base_dir: str = "../../output/preprocess/images"
     data_dir: str = f"../../output/preprocess/master_data_v2"
     image_path: str = "images_128x96"
@@ -174,6 +176,7 @@ class NFLDataset(Dataset):
         logger.info("_get_item_information start")
 
         failed_count = 0
+        np.random.seed(0)
 
         contacts_all = []
         for key, w_df in tqdm.tqdm(df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])):
@@ -185,8 +188,7 @@ class NFLDataset(Dataset):
             contact_ids = w_df["contact_id"].values
             frames = w_df["frame"].values
             contacts = w_df["contact"].values
-            distances = w_df["distance"].values
-            np.random.seed(0)
+            distances = w_df["distance"].fillna(0).values
 
             for i in range(len(w_df)):
                 if not self.test and i % self.config.use_data_step != 0:
@@ -208,8 +210,14 @@ class NFLDataset(Dataset):
                 if distances[i] > 1.75:
                     continue
 
-                if contacts[predict_frames_indice].sum() == 0 and np.random.random() > self.config.negative_sample_ratio and not self.test:
-                    continue
+                if not self.test and contacts[predict_frames_indice].sum() == 0:
+                    # down sampling (only negative)
+                    if distances[i] < 0.75 and np.random.random() > self.config.negative_sample_ratio_close and id_2 != "G":
+                        continue
+                    if distances[i] >= 0.75 and np.random.random() > self.config.negative_sample_ratio_far:
+                        continue
+                    if id_2 == "G" and np.random.random() > self.config.negative_sample_ratio_far:
+                        continue
 
                 if not self._exist_files(game_play=game_play, id_1=id_1, id_2=id_2, frames=frame_indice):
                     failed_count += 1
@@ -613,7 +621,7 @@ def main(config):
     )
 
     model = model.to(device)
-    optimizer = torch.optim.Adam(params=model.parameters(), lr=config.lr)
+    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     criterion = nn.BCEWithLogitsLoss()
     scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer, num_warmup_steps=50, num_training_steps=config.num_training_steps
@@ -702,10 +710,36 @@ def main(config):
 
 
 if __name__ == "__main__":
+    # image_path = "images_128x96"
+    # exp_name = f"2d_data_v2"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn_3layers",
+    #                 image_path=image_path, gradient_clipping=1, model_name="tf_efficientnet_b0_ns")
+    # main(config)
+    #
+    # image_path = "images_128x96"
+    # for weight_decay in [0.1, 0.01, 0.001]:
+    #     exp_name = f"3d_weight_decay{weight_decay}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten", weight_decay=weight_decay,
+    #                     image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18")
+    #     main(config)
+    #
+    # exp_name = f"3d_neg_far0.025_close0.5"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 negative_sample_ratio_close=0.5,
+    #                 negative_sample_ratio_far=0.025,
+    #                 image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18")
+    # main(config)
 
-    image_path = "images_128x96"
-    exp_name = f"3d_data_v2"
+    # exp_name = f"3d_neg_far0.05_close1"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 negative_sample_ratio_close=1,
+    #                 negative_sample_ratio_far=0.05,
+    #                 gradient_clipping=1, model_name="cnn_3d_r3d_18")
+    # main(config)
+
+    exp_name = f"3d_neg_far0.05_close1"
     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-                    image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18")
+                    negative_sample_ratio_close=0.2,
+                    negative_sample_ratio_far=0.05,
+                    gradient_clipping=1, model_name="cnn_3d_r3d_18")
     main(config)
-

@@ -76,7 +76,7 @@ class LGBMModel:
                             df: pd.DataFrame,
                             inference: bool = True):
         # all
-        feature_path = f"{self.feature_dir}/feature_len{len(df)}.feather"
+        feature_path = f"{self.feature_dir}/{os.path.basename(__file__).replace('.py', '')}feature_len{len(df)}.feather"
         if os.path.isfile(feature_path) and not inference:
             self.logger.info("load from feature_dir")
             return pd.read_feather(feature_path)
@@ -173,6 +173,7 @@ class LGBMModel:
 
         if not inference:
             self.logger.info("save feather")
+            os.makedirs(os.path.dirname(feature_path), exist_ok=True)
             df_rets.to_feather(feature_path)
 
         return df_rets

@@ -55,14 +55,16 @@ class Config:
         epochs: int = 1
 
     lr: float = 1e-4
+    weight_decay: float = 0.001
     n_frames: int = 31
     n_predict_frames: int = 1
 
     if n_frames % 2 == 0 or n_predict_frames % 2 == 0:
         raise ValueError
-    step: int = 3
+    step: int = 4
     extention: str = ".npy"
-    negative_sample_ratio: float = 0.05
+    negative_sample_ratio_close: float = 0.2
+    negative_sample_ratio_far: float = 0.2
     base_dir: str = "../../output/preprocess/images"
     data_dir: str = f"../../output/preprocess/master_data_v2"
     image_path: str = "images_128x96"
@@ -87,6 +89,8 @@ class Config:
     hidden_size_1d: int = 32
 
     submission_mode: bool = False
+
+    distance_threshold: float = 1.75
 
 
 class NFLDataset(Dataset):
@@ -174,9 +178,16 @@ class NFLDataset(Dataset):
         logger.info("_get_item_information start")
 
         failed_count = 0
+        np.random.seed(0)
 
         contacts_all = []
-        for key, w_df in tqdm.tqdm(df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])):
+        for key, w_df in tqdm.tqdm(
+            df.drop_duplicates(
+                ["game_play", "nfl_player_id_1", "nfl_player_id_2", "frame"]
+            ).groupby(
+                ["game_play", "nfl_player_id_1", "nfl_player_id_2"]
+            )
+        ):
             game_play = key[0]
             id_1 = key[1]
             id_2 = key[2]
@@ -185,8 +196,7 @@ class NFLDataset(Dataset):
             contact_ids = w_df["contact_id"].values
             frames = w_df["frame"].values
             contacts = w_df["contact"].values
-            distances = w_df["distance"].values
-            np.random.seed(0)
+            distances = w_df["distance"].fillna(0).values
 
             for i in range(len(w_df)):
                 if not self.test and i % self.config.use_data_step != 0:
@@ -205,11 +215,17 @@ class NFLDataset(Dataset):
                     i + window + 1,
                 )
                 assert len(predict_frames_indice) == self.config.n_predict_frames
-                if distances[i] > 1.75:
+                if distances[i] > self.config.distance_threshold:
                     continue
 
-                if contacts[predict_frames_indice].sum() == 0 and np.random.random() > self.config.negative_sample_ratio and not self.test:
-                    continue
+                if not self.test and contacts[predict_frames_indice].sum() == 0:
+                    # down sampling (only negative)
+                    if distances[i] < 0.75 and np.random.random() > self.config.negative_sample_ratio_close and id_2 != "G":
+                        continue
+                    if distances[i] >= 0.75 and np.random.random() > self.config.negative_sample_ratio_far:
+                        continue
+                    if id_2 == "G" and np.random.random() > self.config.negative_sample_ratio_far:
+                        continue
 
                 if not self._exist_files(game_play=game_play, id_1=id_1, id_2=id_2, frames=frame_indice):
                     failed_count += 1
@@ -388,6 +404,47 @@ def eval_fn(data_loader, model, criterion, device):
     return df_ret, loss_score.avg
 
 
+class SimpleConv3d(nn.Module):
+    def __init__(self,
+                 hidden_size_3d,
+                 config: Config):
+        super(SimpleConv3d, self).__init__()
+        hid = hidden_size_3d // 16 + 1
+        self.fc = nn.Conv3d(hidden_size_3d, hid, (13, 2, 2), bias=False, stride=(2, 1, 1), padding=(0, 1, 1))
+        self.bn = nn.BatchNorm3d(hid)
+        self.do = nn.Dropout(0.2)
+        self.activation = config.activation()
+        self.num_features = hid
+
+    def forward(self, x):
+        x = self.activation(self.do(F.relu(self.bn(self.fc(x)))))
+        return x
+
+
+class ThreeLayerConv3d(nn.Module):
+    def __init__(self,
+                 hidden_size_3d,
+                 config: Config):
+        super(ThreeLayerConv3d, self).__init__()
+        hid = hidden_size_3d // 16 + 1
+        self.fc = nn.Conv3d(hidden_size_3d, hid, (5, 2, 2), bias=False, stride=(2, 1, 1), padding=(0, 1, 1))
+        self.bn = nn.BatchNorm3d(hid)
+        self.do = nn.Dropout(0.2)
+        self.fc2 = nn.Conv3d(hid, hid, (3, 2, 2), bias=False, stride=(2, 1, 1), padding=(0, 1, 1))
+        self.bn2 = nn.BatchNorm3d(hid)
+        self.do2 = nn.Dropout(0.25)
+        self.fc3 = nn.Conv3d(hid, hid, (3, 1, 1), bias=False, stride=(2, 1, 1))
+        self.bn3 = nn.BatchNorm3d(hid)
+        self.do3 = nn.Dropout(0.25)
+        self.num_features = hid
+        self.activation = config.activation()
+
+    def forward(self, x):
+        x = self.activation(self.do(F.relu(self.bn(self.fc(x)))))
+        x = self.activation(self.do2(F.relu(self.bn2(self.fc2(x)))))
+        x = self.activation(self.do3(F.relu(self.bn3(self.fc3(x)))))
+        return x
+
 class ThreeLayerConv1DUnit(nn.Module):
     def __init__(self,
                  config: Config):
@@ -444,6 +501,10 @@ class SequenceModel(nn.Module):
             )
         elif config.seq_model == "1dcnn_3layers":
             self.model = ThreeLayerConv1DUnit(config)
+        elif config.seq_model =="3dcnn_simple":
+            self.model = SimpleConv3d(hidden_size_3d=hidden_size, config=config)
+        elif config.seq_model == "3dcnn_3layers":
+            self.model = ThreeLayerConv3d(hidden_size_3d=hidden_size, config=config)
         else:
             raise ValueError(config.seq_model)
 
@@ -462,7 +523,7 @@ class Model(nn.Module):
         self.config = config
         self.cnn_2d = timm.create_model(config.model_name, num_classes=0, pretrained=True)
         self.seq_model = SequenceModel(
-            hidden_size=self.cnn_2d.num_features*2,
+            hidden_size=self.cnn_2d.num_features,
             config=config
         )
         self.fc = nn.LazyLinear(config.n_predict_frames)
@@ -471,12 +532,24 @@ class Model(nn.Module):
         bs, C, seq_len, W, H = x.shape
         x = x.permute(0, 2, 1, 3, 4)  # (bs, seq_len*n_view, C, W, H)
         x = x.reshape(bs*seq_len, C, W, H)  # (bs*seq_len*n_view, C, W, H)
-        x = self.cnn_2d(x)  # (bs*seq_len*n_view, features)
-        x = x.reshape(bs, seq_len, -1)  # (bs, n_view*seq_len, features)
+        if "3dcnn" not in self.config.seq_model:
+            x = self.cnn_2d(x)  # (bs*seq_len*n_view, features)
+            x = x.reshape(bs, seq_len, -1)  # (bs, n_view*seq_len, features)
 
-        x = self.seq_model(x)  # (bs, n_view*seq_len, features)
-        x = x.mean(dim=2)  # (bs, n_view*seq_len)
-        x = self.fc(x)  # (bs, n_view*seq_len, n_predict_frames)
+            x = self.seq_model(x)  # (bs, n_view*seq_len, features)
+            x = x.mean(dim=2)  # (bs, n_view*seq_len)
+            x = self.fc(x)  # (bs, n_view*seq_len, n_predict_frames)
+
+        else:
+            x = self.cnn_2d.forward_features(x)  # (bs*n_view*seq_len, C', W', H')
+            _, C_, W_, H_ = x.shape
+            x = x.reshape(bs*2, seq_len//2, C_, W_, H_)  # (bs*n_view, seq_len, C_, W_, H_)
+            x = x.permute(0, 2, 1, 3, 4)  # (bs*n_view, C_, seq_len, W_, H_)
+            x = self.seq_model(x)  # (bs*2, seq_len, features)
+            x = F.adaptive_avg_pool3d(x, 1).squeeze(4).squeeze(3).squeeze(2)  # (bs*2, C)
+            x = x.reshape(bs, 2, -1)  # (bs, 2, C)
+            x = x.mean(dim=2)
+            x = self.fc(x)  # (bs, seq_len, n_predict_frames)
         return x
 
 class Model3D(nn.Module):
@@ -515,7 +588,7 @@ class Model3D(nn.Module):
             x = self.fc(x)
         elif self.config.seq_model == "1dcnn":
             x = x.reshape(bs, 2, -1)  # (bs, 2, -1)
-            x = self.seq_model(x) # (bs, n_frames, -1)
+            x = self.seq_model(x)  # (bs, n_frames, -1)
             x = x.mean(dim=2)
             x = self.fc(x)
         return x
@@ -613,7 +686,7 @@ def main(config):
     )
 
     model = model.to(device)
-    optimizer = torch.optim.Adam(params=model.parameters(), lr=config.lr)
+    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     criterion = nn.BCEWithLogitsLoss()
     scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer, num_warmup_steps=50, num_training_steps=config.num_training_steps
@@ -630,6 +703,7 @@ def main(config):
             mlflow.log_metric("MCC_all", possible_score_all)
             mlflow.log_metric("MCC_extracted", possible_score_extracted)
             mlflow.log_param("output_dir", output_dir)
+            total_best_score = -1
             for epoch in range(config.epochs):
                 logger.info(f"===============================")
                 logger.info(f"epoch {epoch + 1}")
@@ -694,18 +768,84 @@ def main(config):
                 mlflow.log_metric("val_loss", valid_loss)
                 mlflow.log_metric("score", best_score)
 
+                if total_best_score < best_score:
+                    total_best_score = best_score
+                    mlflow.log_metric("best_score", total_best_score)
+                    mlflow.log_metric("threshold", best_th)
+                    mlflow.log_metric("func", best_func.__name__)
+
                 pd.DataFrame(results).to_csv(f"{output_dir}/results.csv", index=False)
-            mlflow.log_param("threshold", best_th)
-            mlflow.log_param("func", best_func.__name__)
     except Exception as e:
         print(e)
 
 
 if __name__ == "__main__":
+    # for sample_ratio in [0.05, 0.1]:
+    #     exp_name = f"3d_neg_far{sample_ratio}_close{sample_ratio}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                     negative_sample_ratio_close=sample_ratio,
+    #                     negative_sample_ratio_far=sample_ratio,
+    #                     gradient_clipping=1, model_name="cnn_3d_r3d_18")
+    #     main(config)
 
-    image_path = "images_128x96"
-    exp_name = f"3d_data_v2"
+    # for sample_ratio in [0.2, 0.5]:
+    #     exp_name = f"3d_neg_far{sample_ratio}_close{sample_ratio}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                     negative_sample_ratio_close=sample_ratio,
+    #                     negative_sample_ratio_far=sample_ratio,
+    #                     gradient_clipping=1, model_name="cnn_3d_r3d_18",
+    #                     epochs=2)
+    #     main(config)
+
+    # exp_name = f"2d_data_3dcnn"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="3dcnn_simple",
+    #                 grayscale=True, gradient_clipping=1, model_name="tf_efficientnet_b0_ns",
+    #                 epochs=2)
+    # main(config)
+    #
+    # exp_name = f"2d_data_grayscale"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn_3layers",
+    #                 grayscale=True, gradient_clipping=1, model_name="tf_efficientnet_b0_ns",
+    #                 epochs=2)
+    # main(config)
+    #
+    # for step in [4, 6]:
+    #     exp_name = f"3d_neg_step{step}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                     step=step,
+    #                     gradient_clipping=1, model_name="cnn_3d_r3d_18",
+    #                     epochs=2)
+    #     main(config)
+    #
+    # for distance_threshold in [2]:
+    #     exp_name = f"3d_distance_threshold{distance_threshold}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                     distance_threshold=distance_threshold,
+    #                     gradient_clipping=1, model_name="cnn_3d_r3d_18",
+    #                     epochs=2)
+    #     main(config)
+
+    for distance_threshold in [1.5]:
+        exp_name = f"3d_distance_threshold{distance_threshold}"
+        config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+                        distance_threshold=distance_threshold,
+                        gradient_clipping=1, model_name="cnn_3d_r3d_18",
+                        epochs=2)
+        main(config)
+
+    for sample_ratio in [0.05, 0.1]:
+        exp_name = f"3d_neg_far{sample_ratio}_close{sample_ratio}"
+        config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+                        negative_sample_ratio_close=sample_ratio,
+                        negative_sample_ratio_far=sample_ratio,
+                        gradient_clipping=1, model_name="cnn_3d_r3d_18",
+                        epochs=2)
+        main(config)
+
+    exp_name = f"3d_num_training_step10000"
     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-                    image_path=image_path, gradient_clipping=1, model_name="cnn_3d_r3d_18")
+                    num_training_steps=10000,
+                    gradient_clipping=1, model_name="cnn_3d_r3d_18",
+                    epochs=2)
     main(config)
 
