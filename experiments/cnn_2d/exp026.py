@@ -49,7 +49,7 @@ def get_logger(output_dir=None, logging_level=logging.INFO):
 @dataclasses.dataclass
 class Config:
     exp_name: str
-    debug: bool = True
+    debug: bool = False
 
     epochs: int = 1
     if debug:
@@ -589,21 +589,30 @@ class Model(nn.Module):
 
     def forward(self, x, mask):
         bs, C, seq_len, W, H = x.shape
-        x = x.permute(0, 2, 1, 3, 4)  # (bs, seq_len*n_view, C, W, H)
-        x = x.reshape(bs*seq_len, C, W, H)  # (bs*seq_len*n_view, C, W, H)
-        if "3dcnn" not in self.config.seq_model:
-            x = self.cnn_2d(x)  # (bs*seq_len*n_view, features)
-            x = x.reshape(bs, 2, seq_len//2, -1)  # (bs, n_view*seq_len, features)
-            x = x.permute(0, 2, 1, 3)
-            x = x.reshape(bs, seq_len//2, -1)  # (bs, seq_len, n_view*features)
+        x = x.permute(0, 2, 1, 3, 4)
+        x = torch.cat([
+            x[:, :seq_len//2].reshape(-1, C, W, H),
+            x[:, -seq_len//2:].reshape(-1, C, W, H)
+        ])  # shape = (bs*n_view*seq_len, C, W, H)
 
+        if "3dcnn" not in self.config.seq_model:
+            x = self.cnn_2d(x)  # (bs*n_view*seq_len, features)
+            x = torch.cat([
+                x[:bs*(seq_len//2)].reshape(bs, seq_len//2, -1),  # (bs, seq_len, features)
+                x[-bs*(seq_len//2):].reshape(bs, seq_len//2, -1)  # (bs, seq_len, features)
+            ], dim=2)  # (bs, seq_len, n_view*feature)
             x = self.seq_model(x)  # (bs, seq_len, n_view*features)
-            x = x.mean(dim=2)  # (bs, n_view*seq_len)
-            x = self.fc(x)  # (bs, n_view*seq_len, n_predict_frames)
+            x = x.mean(dim=2)  # (bs, seq_len)
+            x = self.fc(x)  # (bs, seq_len, n_predict_frames)
 
         else:
             x = self.cnn_2d.forward_features(x)  # (bs*n_view*seq_len, C', W', H')
             _, C_, W_, H_ = x.shape
+
+            x = torch.stack([
+                x[:bs*(seq_len//2)],
+                x[-bs*(seq_len//2):]
+            ], dim=1)  # (bs*seq_len, n_view, feature)
             x = x.reshape(bs*2, seq_len//2, C_, W_, H_)  # (bs*n_view, seq_len, C_, W_, H_)
             x = x.permute(0, 2, 1, 3, 4)  # (bs*n_view, C_, seq_len, W_, H_)
             x = self.seq_model(x)  # (bs*2, seq_len, features)
@@ -611,7 +620,7 @@ class Model(nn.Module):
             x = x.reshape(bs, 2, -1)  # (bs, 2, C)
             x = x.mean(dim=2)
             x = self.fc(x)  # (bs, seq_len, n_predict_frames)
-        return x
+        return x, None, None
 
 
 class Model2p5D(nn.Module):
@@ -639,8 +648,8 @@ class Model2p5D(nn.Module):
         bs, _, seq_len, W, H = x.shape  # C = 1
         x = x.squeeze(1)  # (bs, n_view*seq_len, W, H)
         x = torch.cat([
-            x[:, :seq_len//2, W, H],
-            x[:, seq_len//2:, W, H]
+            x[:, :seq_len//2],
+            x[:, -seq_len//2:]
         ])
         if "3dcnn" not in self.config.seq_model:
             x = self.cnn_2d(x)  # (bs*n_view, features)
@@ -658,7 +667,7 @@ class Model2p5D(nn.Module):
             x = x.reshape(bs, 2, -1)  # (bs, 2, C)
             x = x.mean(dim=2)
             x = self.fc(x)  # (bs, seq_len, n_predict_frames)
-        return x
+        return x, None, None
 
 
 class Model3D(nn.Module):
@@ -705,34 +714,22 @@ class Model3D(nn.Module):
 
     def forward(self, x, is_g):
         bs, C, seq_len, W, H = x.shape
-        x = x.permute(0, 2, 1, 3, 4)  # (bs, n_view*seq_len, C, W, H)
-        x = x.reshape(bs*2, seq_len//2, C, W, H)   # (bs*n_view, seq_len, C, W, H)
-        x = x.permute(0, 2, 1, 3, 4)
-        x = self.model(x)  # (bs*n_view, fc)
-        x = x.reshape(bs, 2, -1)  # (bs, 2, -1)
 
+        x = torch.cat([
+            x[:, :, :seq_len//2],
+            x[:, :, -seq_len//2:]
+        ])  # (bs*n_view, C, seq_len, W, H)
+        x = self.model(x)  # (bs*n_view, fc)
         x_endzone = None
         x_sideline = None
-        if not self.config.sep_is_g:
-            if self.config.calc_single_view_loss:
-                x_endzone = x[:, 0].reshape(bs, -1)
-                x_sideline = x[:, 1].reshape(bs, -1)
-                x = x.reshape(bs, -1)
+        if self.config.calc_single_view_loss:
+            x_endzone = x[:bs]
+            x_sideline = x[-bs:]
 
-                x_endzone = self.fc_endzone(x_endzone)
-                x_sideline = self.fc_sideline(x_sideline)
-                x = self.fc(x)
-
-            else:
-                x = x.reshape(bs, -1)
-                x = self.fc(x)
-        else:
-            x = x.reshape(bs, -1)
-            x_contact = self.fc_contact(x)  # (bs, n_predict_frames)
-            x_g = self.fc_g(x)  # (bs, n_predict_frames)
-
-            not_is_g = (is_g == 0)
-            x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
+            x_endzone = self.fc_endzone(x_endzone)
+            x_sideline = self.fc_sideline(x_sideline)
+        x = torch.cat([x[:bs], x[-bs:]], dim=1)
+        x = self.fc(x)
 
         return x, x_endzone, x_sideline
 
@@ -769,12 +766,16 @@ def main(config):
         if "cnn_3d" in config.model_name:
             model = Model3D(config=config)
         elif "cnn_2.5d" in config.model_name:
+            if config.calc_single_view_loss:
+                logger.info("calc_single_view_loss not be implemented")
+                config.calc_single_view_loss = False
             model = Model2p5D(config=config)
         else:
             if config.sep_is_g:
                 raise NotImplementedError
             if config.calc_single_view_loss:
-                raise NotImplementedError
+                logger.info("calc_single_view_loss not be implemented")
+                config.calc_single_view_loss = False
             model = Model(config=config)
 
         for train_idx, val_idx in gkfold.split(df_label, groups=df_label["game_play"].values):
@@ -972,24 +973,29 @@ if __name__ == "__main__":
     # main(config)
 
     for image_path in ["images_128x96_helmet", "images_128x96_v2"]:
-        exp_name = f"2.5d_fc_{image_path}"
+        # exp_name = f"2d_{image_path}"
+        # config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn",
+        #                 model_name="tf_efficientnet_b0_ns",
+        #                 epochs=2, image_path=image_path)
+        # main(config)
+        #
+        # exp_name = f"3d_{image_path}"
+        # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+        #                 model_name="cnn_3d_r3d_18",
+        #                 epochs=2, image_path=image_path)
+        # main(config)
+
+        exp_name = f"2.5d_{image_path}"
         config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn",
                         model_name="cnn_2.5d_tf_efficientnet_b0_ns",
                         epochs=2, image_path=image_path)
         main(config)
-
-    exp_name = f"2d_bugfix"
-    config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn",
-                    model_name="tf_efficientnet_b0_ns",
-                    epochs=2)
-    main(config)
 
     exp_name = f"3d_lr_reduce_ratio_0.1"
     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
                     lr_reduce_ratio=0.1,
                     epochs=2)
     main(config)
-
 
     for weight_decay in [0.1, 0.01]:
         exp_name = f"3d_weight_decay{weight_decay}"
