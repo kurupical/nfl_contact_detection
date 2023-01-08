@@ -16,7 +16,7 @@ from transformers import get_linear_schedule_with_warmup
 import cv2
 from torchvision.io.video import read_video
 try:
-    from torchvision.models.video import r3d_18, R3D_18_Weights, mc3_18, MC3_18_Weights
+    from torchvision.models.video import r3d_18, R3D_18_Weights
     import mlflow
 except Exception as e:
     print(e)
@@ -25,7 +25,6 @@ from sklearn.metrics import roc_auc_score, matthews_corrcoef, confusion_matrix
 import shutil
 import torch.nn.functional as F
 import pickle
-from torch.optim.lr_scheduler import StepLR
 from typing import Tuple
 
 torch.backends.cudnn.benchmark = True
@@ -63,12 +62,12 @@ class Config:
     if n_frames % 2 == 0 or n_predict_frames % 2 == 0:
         raise ValueError
     step: int = 4
-    extention: str = ".jpg"
+    extention: str = ".npy"
     negative_sample_ratio_close: float = 0.2
     negative_sample_ratio_far: float = 0.2
     base_dir: str = "../../output/preprocess/images"
     data_dir: str = f"../../output/preprocess/master_data_v2"
-    image_path: str = "images_128x96_helmet"
+    image_path: str = "images_128x96"
     img_shape: Tuple[int, int] = (96, 128)
     gradient_clipping: float = 1
     exist_image_threshold: float = 0.1
@@ -97,15 +96,6 @@ class Config:
 
     calc_single_view_loss_weight: float = 0.5
     check_exist_center_file: bool = False
-
-    criterion: str = "bcewithlogitsloss"
-    fc: str = "simple"
-    fc_dropout: float = 0.2
-    lr_reduce_ratio: float = 1
-
-    scheduler: str = "linear"
-    step_size_ratio: float = 0.25
-    gamma: float = 0.25
 
 
 class NFLDataset(Dataset):
@@ -188,7 +178,7 @@ class NFLDataset(Dataset):
                 return False
         return True
 
-    def _get_item_information(self, df: pd.DataFrame, logger: Logger):
+    def _get_item_information(self, df_helmets: pd.DataFrame, df_gps: pd.DataFrame, logger: Logger):
         self.items = []
         logger.info("_get_item_information start")
 
@@ -201,7 +191,7 @@ class NFLDataset(Dataset):
             df.drop_duplicates(
                 ["game_play", "nfl_player_id_1", "nfl_player_id_2", "step"]
             ).groupby(
-                ["game_play", "nfl_player_id_1", "nfl_player_id_2"]
+                ["game_play", "nfl_player_id_1", "nfl_player_id_2", "step"]
             )
         ):
             game_play = key[0]
@@ -213,6 +203,8 @@ class NFLDataset(Dataset):
             frames = w_df["frame"].values
             contacts = w_df["contact"].values
             distances = w_df["distance"].fillna(0).values
+
+
 
             for i in range(len(w_df)):
                 if not self.test and i % self.config.use_data_step != 0:
@@ -230,6 +222,16 @@ class NFLDataset(Dataset):
                     i - window,
                     i + window + 1,
                 )
+
+                expected_steps = np.arange(
+                    steps[i] - window,
+                    steps[i] + window + 1
+                )
+
+                # contactsが途中で切れているデータは除去する (ex. [5, 10, 11] centerが10だけど, 6~9が抜けている)
+                if (steps[predict_frames_indice] != expected_steps).sum() > 0:
+                    failed_count += 1
+                    continue
 
                 assert len(predict_frames_indice) == self.config.n_predict_frames
                 if distances[i] > self.config.distance_threshold:
@@ -272,17 +274,19 @@ class NFLDataset(Dataset):
 
     def imread(self, game_play, view, id_1, id_2, frame):
         key = self._get_key(game_play, view, id_1, id_2, frame)
-        if os.path.isfile(key):
-            if self.config.extention == ".npy":
+        if self.image_dict is None:
+            if os.path.isfile(key):
                 img = np.load(key)
-            if self.config.extention == ".jpg":
-                img = cv2.imread(key)
+            else:
+                return None
         else:
-            return None
-        if self.config.grayscale or "2.5d" in self.config.model_name:
+            if key in self.image_dict:
+                img = self.image_dict[key]
+            else:
+                return None
+        if self.config.grayscale:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)[:, :, np.newaxis]
-            if "2.5d" not in self.config.model_name:
-                img = np.concatenate([img, img, img], axis=2)
+            img = np.concatenate([img, img, img], axis=2)
         return img
 
     def __getitem__(self, index):
@@ -304,12 +308,7 @@ class NFLDataset(Dataset):
             first_img_idx = [i for i, img in enumerate(imgs) if img is not None]
 
             if len(first_img_idx) == 0:
-                if "2.5d" not in self.config.model_name:
-                    imgs_all.extend(
-                        [np.zeros((self.config.img_shape[0], self.config.img_shape[1], 3)) for _ in range(len(imgs))])
-                else:
-                    imgs_all.extend(
-                        [np.zeros((self.config.img_shape[0], self.config.img_shape[1], 1)) for _ in range(len(imgs))])
+                imgs_all.extend([np.zeros((self.config.img_shape[0], self.config.img_shape[1], 3)) for _ in range(len(imgs))])
                 continue
             first_img_idx = first_img_idx[0]
 
@@ -385,9 +384,9 @@ def train_fn(dataloader, model, criterion, optimizer, device, scheduler, epoch, 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clipping)
+        scheduler.step()
         scaler.step(optimizer)
         scaler.update()
-        scheduler.step()
 
         log_loss(loss_history=loss_100, loss_meter=loss_meter, loss=loss.detach().item(),
                  batch_size=batch_size, name="loss", mode="train")
@@ -399,7 +398,6 @@ def train_fn(dataloader, model, criterion, optimizer, device, scheduler, epoch, 
             log_loss(loss_history=loss_sideline_100, loss_meter=loss_sideline_meter, loss=loss_sideline.detach().item(),
                      batch_size=batch_size, name="loss_sideline", mode="train")
 
-        mlflow.log_metric("lr", optimizer.param_groups[0]['lr'])
         tk0.set_postfix(Loss=loss_meter.avg,
                         LossSnap=np.mean(loss_100),
                         LossCat=loss_concat_meter.avg,
@@ -582,87 +580,21 @@ class Model(nn.Module):
             hidden_size=self.cnn_2d.num_features,
             config=config
         )
-        if self.config.fc == "simple":
-            self.fc = nn.LazyLinear(config.n_predict_frames)
-        elif self.config.fc == "2layer":
-            self.fc = nn.Sequential(
-                nn.LazyLinear(32),
-                nn.Dropout(self.config.fc_dropout),
-                nn.GELU(),
-                nn.Linear(32, config.n_predict_frames)
-            )
+        self.fc = nn.LazyLinear(config.n_predict_frames)
 
-    def forward(self, x, mask):
+    def forward(self, x):
         bs, C, seq_len, W, H = x.shape
-        x = x.permute(0, 2, 1, 3, 4)
-        x = torch.cat([
-            x[:, :seq_len//2].reshape(-1, C, W, H),
-            x[:, -seq_len//2:].reshape(-1, C, W, H)
-        ])  # shape = (bs*n_view*seq_len, C, W, H)
-
+        x = x.permute(0, 2, 1, 3, 4)  # (bs, seq_len*n_view, C, W, H)
+        x = x.reshape(bs*seq_len, C, W, H)  # (bs*seq_len*n_view, C, W, H)
         if "3dcnn" not in self.config.seq_model:
-            x = self.cnn_2d(x)  # (bs*n_view*seq_len, features)
-            x = torch.cat([
-                x[:bs*(seq_len//2)].reshape(bs, seq_len//2, -1),  # (bs, seq_len, features)
-                x[-bs*(seq_len//2):].reshape(bs, seq_len//2, -1)  # (bs, seq_len, features)
-            ], dim=2)  # (bs, seq_len, n_view*feature)
-            x = self.seq_model(x)  # (bs, seq_len, n_view*features)
-            x = x.mean(dim=2)  # (bs, seq_len)
-            x = self.fc(x)  # (bs, seq_len, n_predict_frames)
+            x = self.cnn_2d(x)  # (bs*seq_len*n_view, features)
+            x = x.reshape(bs, seq_len, -1)  # (bs, n_view*seq_len, features)
 
-        else:
-            x = self.cnn_2d.forward_features(x)  # (bs*n_view*seq_len, C', W', H')
-            _, C_, W_, H_ = x.shape
-
-            x = torch.stack([
-                x[:bs*(seq_len//2)],
-                x[-bs*(seq_len//2):]
-            ], dim=1)  # (bs*seq_len, n_view, feature)
-            x = x.reshape(bs*2, seq_len//2, C_, W_, H_)  # (bs*n_view, seq_len, C_, W_, H_)
-            x = x.permute(0, 2, 1, 3, 4)  # (bs*n_view, C_, seq_len, W_, H_)
-            x = self.seq_model(x)  # (bs*2, seq_len, features)
-            x = F.adaptive_avg_pool3d(x, 1).squeeze(4).squeeze(3).squeeze(2)  # (bs*2, C)
-            x = x.reshape(bs, 2, -1)  # (bs, 2, C)
-            x = x.mean(dim=2)
-            x = self.fc(x)  # (bs, seq_len, n_predict_frames)
-        return x, None, None
-
-
-class Model2p5D(nn.Module):
-    def __init__(self,
-                 config: Config):
-        super().__init__()
-        self.config = config
-        self.cnn_2d = timm.create_model(config.model_name.replace("cnn_2.5d_", ""), num_classes=0, pretrained=True,
-                                        in_chans=self.config.n_frames)
-        self.seq_model = SequenceModel(
-            hidden_size=self.cnn_2d.num_features,
-            config=config
-        )
-        if self.config.fc == "simple":
-            self.fc = nn.LazyLinear(config.n_predict_frames)
-        elif self.config.fc == "2layer":
-            self.fc = nn.Sequential(
-                nn.LazyLinear(32),
-                nn.Dropout(self.config.fc_dropout),
-                nn.GELU(),
-                nn.Linear(32, config.n_predict_frames)
-            )
-
-    def forward(self, x, mask):
-        bs, _, seq_len, W, H = x.shape  # C = 1
-        x = x.squeeze(1)  # (bs, n_view*seq_len, W, H)
-        x = torch.cat([
-            x[:, :seq_len//2],
-            x[:, -seq_len//2:]
-        ])
-        if "3dcnn" not in self.config.seq_model:
-            x = self.cnn_2d(x)  # (bs*n_view, features)
-            x = torch.cat([x[:bs], x[bs:]], dim=1)  # (bs, n_view*features)
+            x = self.seq_model(x)  # (bs, n_view*seq_len, features)
+            x = x.mean(dim=2)  # (bs, n_view*seq_len)
             x = self.fc(x)  # (bs, n_view*seq_len, n_predict_frames)
 
         else:
-            raise NotImplementedError
             x = self.cnn_2d.forward_features(x)  # (bs*n_view*seq_len, C', W', H')
             _, C_, W_, H_ = x.shape
             x = x.reshape(bs*2, seq_len//2, C_, W_, H_)  # (bs*n_view, seq_len, C_, W_, H_)
@@ -672,7 +604,7 @@ class Model2p5D(nn.Module):
             x = x.reshape(bs, 2, -1)  # (bs, 2, C)
             x = x.mean(dim=2)
             x = self.fc(x)  # (bs, seq_len, n_predict_frames)
-        return x, None, None
+        return x
 
 
 class Model3D(nn.Module):
@@ -688,14 +620,6 @@ class Model3D(nn.Module):
                 weights = R3D_18_Weights.DEFAULT
                 self.model = r3d_18(weights=weights)
                 self.model.fc = nn.Identity()
-        elif self.config.model_name == "cnn_3d_mc3_18":
-            if self.config.submission_mode:
-                self.model = mc3_18()
-                self.model.fc = nn.Identity()
-            else:
-                weights = MC3_18_Weights.DEFAULT
-                self.model = mc3_18(weights=weights)
-                self.model.fc = nn.Identity()
         if self.config.sep_is_g:
             self.fc_contact = nn.LazyLinear(config.n_predict_frames)
             self.fc_g = nn.LazyLinear(config.n_predict_frames)
@@ -706,16 +630,7 @@ class Model3D(nn.Module):
             if self.config.calc_single_view_loss:
                 self.fc_endzone = nn.LazyLinear(config.n_predict_frames)
                 self.fc_sideline = nn.LazyLinear(config.n_predict_frames)
-
-            if self.config.fc == "simple":
-                self.fc = nn.LazyLinear(config.n_predict_frames)
-            elif self.config.fc == "2layer":
-                self.fc = nn.Sequential(
-                    nn.LazyLinear(32),
-                    nn.Dropout(self.config.fc_dropout),
-                    nn.GELU(),
-                    nn.Linear(32, config.n_predict_frames)
-                )
+            self.fc = nn.LazyLinear(config.n_predict_frames)
 
     def forward(self, x, is_g):
         bs, C, seq_len, W, H = x.shape
@@ -761,121 +676,104 @@ def get_df_from_item(item):
 
 
 def main(config):
+    output_dir = f"../../output/cnn_graph/{os.path.basename(__file__).replace('.py', '')}/{dt.now().strftime('%Y%m%d%H%M%S')}_{config.exp_name}"
+    os.makedirs(output_dir, exist_ok=True)
+    shutil.copy(__file__, output_dir)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    with open(f"{output_dir}/cfg.pickle", "wb") as f:
+        pickle.dump(config, f)
+
+    base_dir = config.base_dir
+    df = pd.read_feather(f"{config.data_dir}/gps.feather")
+    logger = get_logger(output_dir)
+    logger.info("start!")
+    gkfold = GroupKFold(5)
+
+    df_label = pd.read_csv("../../input/nfl-player-contact-detection/train_labels.csv")
+    if config.debug:
+        df_label = df_label.iloc[:150000]
+
+    if "cnn_3d" in config.model_name:
+        model = Model3D(config=config)
+    else:
+        if config.sep_is_g:
+            raise NotImplementedError
+        if config.calc_single_view_loss:
+            raise NotImplementedError
+        model = Model(config=config)
+
+    for train_idx, val_idx in gkfold.split(df_label, groups=df_label["game_play"].values):
+        df_label_train = df_label.iloc[train_idx]
+        df_label_val = df_label.iloc[val_idx]
+        df_train = df[df["game_play"].isin(df_label_train["game_play"].values)]
+        df_val = df[df["game_play"].isin(df_label_val["game_play"].values)]
+        break
+    df_merge = pd.merge(
+        df_label[["contact_id", "contact"]],
+        df[["contact_id", "contact"]].rename(columns={"contact": "pred"}),
+        how="left"
+    ).fillna(0).sort_values("contact", ascending=False).drop_duplicates("contact_id")
+    possible_score_all = matthews_corrcoef(df_merge["contact"].values, df_merge["pred"].values == 1)
+    logger.info(f"possible MCC score: {possible_score_all}")
+
+    train_dataset = NFLDataset(
+        df=df_train,
+        base_dir=f"{base_dir}/{config.image_path}",
+        logger=logger,
+        config=config,
+        test=False
+    )
+
+    val_dataset = NFLDataset(
+        df=df_val,
+        base_dir=f"{base_dir}/{config.image_path}",
+        logger=logger,
+        config=config,
+        test=True
+    )
+    df_val_dataset = pd.concat([get_df_from_item(item) for item in val_dataset.items])
+    df_merge = pd.merge(
+        df_label_val[["contact_id", "contact"]],
+        df_val_dataset[["contact_id", "contact"]].rename(columns={"contact": "pred"}),
+        how="left"
+    ).fillna(0).sort_values("contact", ascending=False).drop_duplicates("contact_id")
+    possible_score_extracted = matthews_corrcoef(df_merge["contact"].values, df_merge["pred"].values)
+    logger.info(f"possible MCC score: {possible_score_extracted}")
+
+    if config.debug:
+        train_dataset.items = train_dataset.items[:200]
+        val_dataset.items = val_dataset.items[:200]
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        pin_memory=True,
+        drop_last=True,
+        num_workers=8
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        pin_memory=True,
+        drop_last=False,
+        num_workers=8
+    )
+
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    criterion = nn.BCEWithLogitsLoss()
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer=optimizer, num_warmup_steps=50, num_training_steps=config.num_training_steps
+    )
+
+    results = []
+    mlflow.set_tracking_uri('../../mlruns/')
+
     try:
-        output_dir = f"../../output/cnn_3d/{os.path.basename(__file__).replace('.py', '')}/{dt.now().strftime('%Y%m%d%H%M%S')}_{config.exp_name}"
-        os.makedirs(output_dir, exist_ok=True)
-        shutil.copy(__file__, output_dir)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        with open(f"{output_dir}/cfg.pickle", "wb") as f:
-            pickle.dump(config, f)
-
-        base_dir = config.base_dir
-        df = pd.read_feather(f"{config.data_dir}/gps.feather")
-        logger = get_logger(output_dir)
-        logger.info("start!")
-        gkfold = GroupKFold(5)
-
-        df_label = pd.read_csv("../../input/nfl-player-contact-detection/train_labels.csv")
-        if config.debug:
-            df_label = df_label.iloc[:150000]
-
-        if "cnn_3d" in config.model_name:
-            model = Model3D(config=config)
-        elif "cnn_2.5d" in config.model_name:
-            if config.calc_single_view_loss:
-                logger.info("calc_single_view_loss not be implemented")
-                config.calc_single_view_loss = False
-            model = Model2p5D(config=config)
-        else:
-            if config.sep_is_g:
-                raise NotImplementedError
-            if config.calc_single_view_loss:
-                logger.info("calc_single_view_loss not be implemented")
-                config.calc_single_view_loss = False
-            model = Model(config=config)
-
-        for train_idx, val_idx in gkfold.split(df_label, groups=df_label["game_play"].values):
-            df_label_train = df_label.iloc[train_idx]
-            df_label_val = df_label.iloc[val_idx]
-            df_train = df[df["game_play"].isin(df_label_train["game_play"].values)]
-            df_val = df[df["game_play"].isin(df_label_val["game_play"].values)]
-            break
-        df_merge = pd.merge(
-            df_label[["contact_id", "contact"]],
-            df[["contact_id", "contact"]].rename(columns={"contact": "pred"}),
-            how="left"
-        ).fillna(0).sort_values("contact", ascending=False).drop_duplicates("contact_id")
-        possible_score_all = matthews_corrcoef(df_merge["contact"].values, df_merge["pred"].values == 1)
-        logger.info(f"possible MCC score: {possible_score_all}")
-
-        train_dataset = NFLDataset(
-            df=df_train,
-            base_dir=f"{base_dir}/{config.image_path}",
-            logger=logger,
-            config=config,
-            test=False
-        )
-
-        val_dataset = NFLDataset(
-            df=df_val,
-            base_dir=f"{base_dir}/{config.image_path}",
-            logger=logger,
-            config=config,
-            test=True
-        )
-        df_val_dataset = pd.concat([get_df_from_item(item) for item in val_dataset.items])
-        df_merge = pd.merge(
-            df_label_val[["contact_id", "contact"]],
-            df_val_dataset[["contact_id", "contact"]].rename(columns={"contact": "pred"}),
-            how="left"
-        ).fillna(0).sort_values("contact", ascending=False).drop_duplicates("contact_id")
-        possible_score_extracted = matthews_corrcoef(df_merge["contact"].values, df_merge["pred"].values)
-        logger.info(f"possible MCC score: {possible_score_extracted}")
-
-        if config.debug:
-            train_dataset.items = train_dataset.items[:200]
-            val_dataset.items = val_dataset.items[:200]
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.batch_size,
-            shuffle=True,
-            pin_memory=True,
-            drop_last=True,
-            num_workers=8
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            pin_memory=True,
-            drop_last=False,
-            num_workers=8
-        )
-
-        model = model.to(device)
-        optimizer = torch.optim.AdamW(params=model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-
-        if config.criterion == "bcewithlogitsloss":
-            criterion = nn.BCEWithLogitsLoss()
-        elif config.criterion == "l1loss":
-            criterion = nn.L1Loss()
-        elif config.criterion == "mseloss":
-            criterion = nn.MSELoss()
-
-        if config.scheduler == "linear":
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer=optimizer, num_warmup_steps=50, num_training_steps=config.num_training_steps
-            )
-        if config.scheduler == "StepLR":
-            scheduler = StepLR(
-                optimizer=optimizer, step_size=int(len(train_loader) * config.step_size_ratio), gamma=config.gamma,
-            )
-        results = []
-        mlflow.set_tracking_uri('../../mlruns/')
-
         with mlflow.start_run(run_name=config.exp_name):
             for k, v in config.__dict__.items():
                 mlflow.log_param(k, v)
@@ -905,8 +803,6 @@ def main(config):
                     criterion,
                     device
                 )
-
-                scheduler.base_lrs = [lr_ * config.lr_reduce_ratio for lr_ in scheduler.base_lrs]
                 df_merge = pd.merge(df_label_val, df_pred, how="left")
                 df_merge["score"] = df_merge["score"].fillna(0)
 
@@ -937,8 +833,7 @@ def main(config):
                 logger.info(f"best: {best_score} (th={best_th}, func={best_func})")
                 logger.info(f"******************************************")
                 df_merge.to_csv(f"{output_dir}/pred_{epoch}.csv", index=False)
-                if not config.debug:
-                    torch.save(model.state_dict(), f"{output_dir}/epoch{epoch}.pth")
+                torch.save(model.state_dict(), f"{output_dir}/epoch{epoch}.pth")
 
                 results.append({
                     "epoch": epoch,
@@ -962,123 +857,62 @@ def main(config):
 
 
 if __name__ == "__main__":
-
-    # MEMO: 1/5朝起きた時点で 128x96_v2に差し替えるぞ
-    # exp_name = f"3d_grayscale+helmet"
+    # exp_name = f"3d_sep_g_contact"
     # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 image_path="images_128x96_helmet", extention=".jpg",
     #                 gradient_clipping=1, model_name="cnn_3d_r3d_18",
-    #                 epochs=2)
+    #                 epochs=2, sep_is_g=True)
     # main(config)
     #
-    # for model_name in ["cnn_3d_mc3_18"]:
-    #     exp_name = f"3d_{model_name}"
+    # for calc_single_view_loss_weight in [0.5, 1]:
+    #     exp_name = f"3d_calc_view_loss_contact_weight{calc_single_view_loss_weight}"
     #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                     gradient_clipping=1, model_name=model_name,
-    #                     epochs=2)
-    #     main(config)
-    #
-    # for sample_ratio in [0.2, 0.1]:
-    #     exp_name = f"3d_neg_far{sample_ratio}_close{sample_ratio}"
-    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                     negative_sample_ratio_close=sample_ratio,
-    #                     negative_sample_ratio_far=sample_ratio,
-    #                     image_path="images_128x96_v2", extention=".jpg",
     #                     gradient_clipping=1, model_name="cnn_3d_r3d_18",
+    #                     calc_single_view_loss_weight=calc_single_view_loss_weight,
+    #                     epochs=2, calc_single_view_loss=True)
+    #     main(config)
+    #
+    # for use_data_step in [2]:
+    #     exp_name = f"3d_predict_frames3_datastep{use_data_step}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                     gradient_clipping=1, model_name="cnn_3d_r3d_18",
+    #                     n_predict_frames=3,
+    #                     use_data_step=use_data_step,
     #                     epochs=2)
     #     main(config)
-
-    # for image_path in ["images_128x96_helmet", "images_128x96_v2"]:
-    #     exp_name = f"2d_{image_path}"
-    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn",
-    #                     model_name="tf_efficientnet_b0_ns",
-    #                     epochs=2, image_path=image_path)
-    #     main(config)
     #
-    #     exp_name = f"3d_{image_path}"
+    # for calc_single_view_loss_weight in [0.25]:
+    #     exp_name = f"3d_calc_view_loss_contact_weight{calc_single_view_loss_weight}"
     #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                     model_name="cnn_3d_r3d_18",
-    #                     epochs=2, image_path=image_path)
+    #                     gradient_clipping=1, model_name="cnn_3d_r3d_18",
+    #                     calc_single_view_loss_weight=calc_single_view_loss_weight,
+    #                     epochs=2, calc_single_view_loss=True)
     #     main(config)
-    #
-    #     exp_name = f"2.5d_{image_path}"
-    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn",
-    #                     model_name="cnn_2.5d_tf_efficientnet_b0_ns",
-    #                     epochs=2, image_path=image_path)
-    #     main(config)
-    #
-    # exp_name = f"3d_lr_reduce_ratio_0.1"
+
+    # exp_name = f"3d_predict_frames3_check_exist_center_file"
     # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 lr_reduce_ratio=0.1,
+    #                 gradient_clipping=1, model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3, check_exist_center_file=True,
     #                 epochs=2)
     # main(config)
-    #
-    # for weight_decay in [0.1, 0.01]:
-    #     exp_name = f"3d_weight_decay{weight_decay}"
-    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                     weight_decay=weight_decay,
-    #                     epochs=2)
-    #     main(config)
-    #
-    # for gradient_clipping in [0.2]:
-    #     exp_name = f"3d_gradient_clipping{gradient_clipping}"
-    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                     gradient_clipping=gradient_clipping,
-    #                     epochs=2)
-    #     main(config)
 
-    # exp_name = f"3d_num_training_step5000"
-    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 num_training_steps=5000,
-    #                 gradient_clipping=1, model_name="cnn_3d_r3d_18",
-    #                 epochs=1)
-    # main(config)
-
-    #
-    # exp_name = f"3d_fc_dropout"
-    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 num_training_steps=5000,
-    #                 gradient_clipping=0.2,
-    #                 epochs=1)
-    # main(config)
-
-    # exp_name = f"3d_steplr"
-    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 scheduler="StepLR", gradient_clipping=0.2, epochs=1)
-    # main(config)
-
-    for step_size_ratio in [0.4, 0.5]:
-        exp_name = f"3d_steplr_step_size_ratio{step_size_ratio}"
-        config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-                        scheduler="StepLR", gradient_clipping=0.2, epochs=2,
-                        step_size_ratio=step_size_ratio)
-        main(config)
-    exp_name = f"3d_close1"
+    exp_name = f"3d_check_exist_center_file"
     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-                    negative_sample_ratio_close=1, gradient_clipping=0.2, epochs=1)
+                    gradient_clipping=1, model_name="cnn_3d_r3d_18",
+                    epochs=2, check_exist_center_file=True)
     main(config)
 
+    for sample_ratio in [0.05, 0.1]:
+        exp_name = f"3d_neg_far{sample_ratio}_close{sample_ratio}"
+        config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+                        negative_sample_ratio_close=sample_ratio,
+                        negative_sample_ratio_far=sample_ratio,
+                        gradient_clipping=1, model_name="cnn_3d_r3d_18",
+                        epochs=2)
+        main(config)
 
-    # exp_name = f"3d_nframes63_step2"
-    # config = Config(exp_name=exp_name, n_frames=63, seq_model="flatten",
-    #                 step=2,
-    #                 gradient_clipping=1, model_name="cnn_3d_r3d_18",
-    #                 epochs=2)
-    # main(config)
-    #
-    # exp_name = f"3d_num_training_step5000"
-    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 num_training_steps=5000,
-    #                 gradient_clipping=1, model_name="cnn_3d_r3d_18",
-    #                 epochs=1)
-    # main(config)
-    #
-    # exp_name = f"3d_num_training_step10000"
-    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 num_training_steps=10000,
-    #                 gradient_clipping=1, model_name="cnn_3d_r3d_18",
-    #                 epochs=2)
-    # main(config)
-
-
-
+    exp_name = f"3d_num_training_step10000"
+    config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+                    num_training_steps=10000,
+                    gradient_clipping=1, model_name="cnn_3d_r3d_18",
+                    epochs=2)
+    main(config)

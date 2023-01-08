@@ -79,11 +79,11 @@ class Config:
     num_training_steps: int = 100000
 
     # transformer
-    hidden_size_transformer: int = 178  # TODO: exp002に合わせて
+    hidden_size_transformer: int = 10  # TODO: exp002に合わせて
     num_layer_transformer: int = 2
     nhead: int = 2
     num_layer_rnn: int = 1
-    feature_dir: str = "../../output/preprocess/feature/exp002/feature_len9443236.feather"
+    feature_dir: str = "../../output/preprocess/feature/exp004/feature_len9443236.feather"
     max_length: int = 192
 
     # 2d_cnn
@@ -199,7 +199,11 @@ class NFLDataset(Dataset):
 
             contact_ids = [""] * config.max_length
             contact_ids[:len(w_df)] = w_df["contact_id"].values.tolist()
-            w_df = w_df.drop(drop_columns, axis=1).fillna(0).replace(np.inf, 0).replace(-np.inf, 0)
+            # w_df = w_df.drop(drop_columns, axis=1).fillna(0).replace(np.inf, 0).replace(-np.inf, 0)
+            use_features = pd.read_csv(
+                "../../output/lgbm/exp004/20230106205611/feature_importance.csv"
+            )["col"].values[:10]
+            w_df = w_df[use_features].fillna(0).replace(np.inf, 0).replace(-np.inf, 0)
 
             feature_ary = np.zeros((config.max_length, config.hidden_size_transformer))
             feature_ary[:len(w_df), :] = w_df.values
@@ -507,7 +511,7 @@ def main(config):
     mlflow.set_tracking_uri('../../mlruns/')
 
     try:
-        with mlflow.start_run(run_name=config.exp_name):
+        with mlflow.start_run(run_name=config.exp_name, experiment_id=2):
             for k, v in config.__dict__.items():
                 mlflow.log_param(k, v)
 

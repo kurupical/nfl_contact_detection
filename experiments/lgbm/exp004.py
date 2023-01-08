@@ -10,8 +10,16 @@ from datetime import datetime as dt
 from sklearn.metrics import confusion_matrix, matthews_corrcoef, roc_auc_score
 from logging import Logger, StreamHandler, Formatter, FileHandler
 import logging
+import gc
+try:
+    import mlflow
+except Exception as e:
+    print(e)
+
 pd.set_option("max_row", 1000)
 pd.set_option("max_column", 200)
+
+debug = False
 
 def sin(x):
     ans = np.sin(x / 180 * np.pi)
@@ -20,6 +28,35 @@ def sin(x):
 def cos(x):
     ans = np.cos(x / 180 * np.pi)
     return ans
+
+
+def reduce_mem_usage(df, verbose=True):
+    numerics = ['int16', 'int32', 'int64', 'float16', 'float32', 'float64']
+    start_mem = df.memory_usage().sum() / 1024**2
+    for col in df.columns:
+        col_type = df[col].dtypes
+        if col_type in numerics:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)
+            else:
+                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                    df[col] = df[col].astype(np.float16)
+                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+    end_mem = df.memory_usage().sum() / 1024**2
+    if verbose: print('Mem. usage decreased to {:5.2f} Mb ({:.1f}% reduction)'.format(end_mem, 100 * (start_mem - end_mem) / start_mem))
+    return df
 
 
 def get_logger(output_dir=None, logging_level=logging.INFO):
@@ -43,6 +80,7 @@ class LGBMModel:
                  output_dir: str,
                  logger: Logger,
                  exp_id: str,
+                 debug: bool = False,
                  params: dict = None):
         if params is None:
             self.logger = logger
@@ -62,6 +100,7 @@ class LGBMModel:
                 "early_stopping_rounds": 100,
                 "learning_rate": 0.1,
             }
+        self.debug = debug
         self.output_dir = output_dir
         self.exp_id = exp_id
         self.feature_dir = "../../output/preprocess/feature"
@@ -76,10 +115,13 @@ class LGBMModel:
                             df: pd.DataFrame,
                             inference: bool = True):
         # all
-        feature_path = f"{self.feature_dir}/{os.path.basename(__file__).replace('.py', '')}feature_len{len(df)}.feather"
-        if os.path.isfile(feature_path) and not inference:
+        # df = df[df["distance"].fillna(0) <= 2]
+        feature_path = f"{self.feature_dir}/{os.path.basename(__file__).replace('.py', '')}/feature_len{len(df)}.feather"
+        if os.path.isfile(feature_path) and not inference and not self.debug:
             self.logger.info("load from feature_dir")
             return pd.read_feather(feature_path)
+        self.logger.info("Reduce memory usage")
+        df = reduce_mem_usage(df)
 
         self.logger.info("FE1: all features")
 
@@ -98,17 +140,27 @@ class LGBMModel:
         df = pd.merge(df, df_sideline, how="left")
         self.logger.info(f"[aggregate view]after: {len(df)}")
 
+        player_features = [
+            "x_position_1",
+            "y_position_1",
+            "x_position_2",
+            "y_position_2",
+            "distance_1",
+            "distance_2",
+        ]
+
         for col in ["orientation", "direction"]:
             for player_id in [1, 2]:
                 col_name = f"{col}_{player_id}"
                 df[f'{col_name}_sin'] = df[col_name].apply(lambda x: sin(x))
                 df[f'{col_name}_cos'] = df[col_name].apply(lambda x: cos(x))
 
-            for col2 in ["acceleration", "sa"]:
+            for col2 in ["acceleration", "speed"]:
                 for col3 in ["sin", "cos"]:
                     for player_id in [1, 2]:
                         col_name = f"{col}_{col2}_{col3}_{player_id}"
                         df[col_name] = df[f"{col2}_{player_id}"] * df[f"{col}_{player_id}_{col3}"]
+                        player_features.append(col_name)
 
         df["distance"] = np.sqrt(
             (df["x_position_1"].values - df["x_position_2"]) ** 2 + \
@@ -125,28 +177,30 @@ class LGBMModel:
         df["move_sensor"] = df["distance_1"] + df["distance_2"]
 
         df["is_same_team"] = df["team_1"] == df["team_2"]
-        df["is_G"] = df["nfl_player_id_2"] == "G"
         for col in ["orientation", "direction"]:
-            for col2 in ["acceleration", "sa"]:
+            for col2 in ["acceleration", "speed"]:
                 for col3 in ["sin", "cos"]:
                     col_name = f"{col}_{col2}_{col3}"
                     df[f"{col_name}_diff"] = df[f"{col_name}_1"] - df[f"{col_name}_2"]
 
         # group by pair
         df_rets = []
-
         lag_columns = [
             "distance",
             "move_sensor",
+            "distance_helmet_mean",
             "orientation_acceleration_sin_diff",
             "orientation_acceleration_cos_diff",
-            "orientation_sa_sin_diff",
-            "orientation_sa_cos_diff",
+            "orientation_speed_sin_diff",
+            "orientation_speed_cos_diff",
             "direction_acceleration_sin_diff",
             "direction_acceleration_cos_diff",
-            "direction_sa_sin_diff",
-            "direction_sa_cos_diff",
+            "direction_speed_sin_diff",
+            "direction_speed_cos_diff",
         ]
+
+        # G精度向上のために player_1 のlag情報追加
+        lag_columns += player_features
 
         for view in ["Endzone", "Sideline"]:
             lag_columns.extend([
@@ -160,7 +214,7 @@ class LGBMModel:
         # TODO: speedup
         for _, w_df in tqdm.tqdm(df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])):
             # lag
-            for lag in [1, 5, 10, 20, 60]:
+            for lag in [1, 5, 10, 20, -1, -5, -10, -20]:
                 cols = [f"{lag_column}_lag{lag}" for lag_column in lag_columns]
                 w_df[cols] = w_df[lag_columns].diff(lag)
             df_rets.append(w_df)
@@ -171,11 +225,43 @@ class LGBMModel:
             df_rets[f"{view}_move_helmet"] = df_rets[[f"{view}_move_helmet_1", f"{view}_move_helmet_2"]].mean(axis=1)
         df_rets["move_helmet"] = df_rets[["Endzone_move_helmet", "Sideline_move_helmet"]].mean(axis=1)
 
+        # # 2nd groupby -> memory leakなったら面倒なので後で。。
+        # lag_columns2 = ["move_helmet"]
+        # df_rets2 = []
+        # for _, w_df in tqdm.tqdm(df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])):
+        #     # lag
+        #     for lag in [1, 5, 10, 20, 60]:
+        #         cols = [f"{lag_column}_lag{lag}" for lag_column in lag_columns2]
+        #         w_df[cols] = w_df[lag_columns2].diff(lag)
+        #     df_rets2.append(w_df)
+        # df_rets2 = pd.concat(df_rets2).sort_index().reset_index(drop=True)
+
+        agg_cols = [
+            "distance", "move_helmet", "move_sensor", "distance_helmet_mean",
+            "distance_lag1", "distance_lag20",
+            "move_sensor_lag1", "move_sensor_lag20",
+            "distance_helmet_mean_lag1", "distance_helmet_mean_lag20",
+        ]
+
+        agg_cols += player_features
+
+        agg_cols += [f"{f}_lag1" for f in player_features]
+        agg_cols += [f"{f}_lag5" for f in player_features]
+        self.logger.info("aggregate features")
+        for agg_col in tqdm.tqdm(agg_cols):
+            col_name = f"{agg_col}_mean"
+            mean = df_rets.groupby("game_play")[agg_col].transform("mean")
+            df_rets[f"diff_{col_name}"] = df_rets[agg_col] - mean
+
+        self.logger.info("Reduce memory usage")
+        df_rets = reduce_mem_usage(df_rets)
+
         if not inference:
             self.logger.info("save feather")
             os.makedirs(os.path.dirname(feature_path), exist_ok=True)
             df_rets.to_feather(feature_path)
 
+        self.logger.info(f"feature engineering end! {df_rets.shape}")
         return df_rets
 
     def train(self,
@@ -183,20 +269,23 @@ class LGBMModel:
               df_label: pd.DataFrame = None):
 
         gkfold = GroupKFold(5)
-        df_test = df.iloc[:1000].copy()
-        df = self.feature_engineering(df, inference=False)
+        df_fe = self.feature_engineering(df, inference=False)
         if df_label is None:
-            df_label = pd.read_csv("../../input/nfl-player-contact-detection/train_labels.csv")
-            # df_label = df
+            if self.debug:
+                df_label = df
+            else:
+                df_label = pd.read_csv("../../input/nfl-player-contact-detection/train_labels.csv")
 
-        self.logger.info((df.isnull().sum() / len(df)).sort_values())
+        self.logger.info((df_fe.isnull().sum() / len(df_fe)).sort_values())
 
         for train_idx, val_idx in gkfold.split(df_label, groups=df_label["game_play"].values):
             df_label_train = df_label.iloc[train_idx]
             df_label_val = df_label.iloc[val_idx]
-            df_train = df[df["game_play"].isin(df_label_train["game_play"].values)]
-            df_val = df[df["game_play"].isin(df_label_val["game_play"].values)]
+            df_train = df_fe[df_fe["game_play"].isin(df_label_train["game_play"].values)]
+            df_val = df_fe[df_fe["game_play"].isin(df_label_val["game_play"].values)]
+            df_test = df[df["game_play"].isin(df_label_val["game_play"].values)]
             break
+        del df_fe; gc.collect()
 
         df_merge = pd.merge(
             df_label_val[["contact_id", "contact"]],
@@ -220,9 +309,21 @@ class LGBMModel:
         self.model.save_model(self.model_dir)
 
         # inference
-        pred = self.model.predict(df_val[self.model.feature_name()])
-        df_val["pred"] = pred
-        contact = df_val["contact"].values
+        self.model = lgb.Booster(model_file=self.model_dir)
+        pred, contact_id = self.predict(df_test)
+
+        df_pred = pd.DataFrame({
+            "contact_id": contact_id,
+            "pred": pred
+        })
+
+        df_merge = pd.merge(
+            df_label_val, df_pred, how="left"
+        )
+        df_merge["pred"] = df_merge["pred"].fillna(0)
+
+        pred = df_merge["pred"].values
+        contact = df_merge["contact"].values
 
         self.logger.info(f"auc: {roc_auc_score(contact, pred)}")
         self.logger.info("------- MCC -------")
@@ -231,16 +332,12 @@ class LGBMModel:
 
         pd.DataFrame({
             "col": self.model.feature_name(),
-            "imp": self.model.feature_importance() / self.model.feature_importance().sum()
+            "imp": self.model.feature_importance("gain") / self.model.feature_importance("gain").sum()
         }).sort_values("imp", ascending=False).to_csv(f"{self.output_dir}/feature_importance.csv", index=False)
         pd.DataFrame({
-            "contact_id": df_val["contact_id"].values,
+            "contact_id": df_merge["contact_id"].values,
             "score": pred
         }).to_csv(f"{self.output_dir}/pred.csv", index=False)
-
-        # inference test
-        self.model = lgb.Booster(model_file=self.model_dir)
-        self.predict(df_test)
 
     def predict(self,
                 df: pd.DataFrame):
@@ -255,9 +352,10 @@ def main():
     logger = get_logger(output_dir)
 
     df = pd.read_feather("../../output/preprocess/master_data_v2/gps.feather")
-    # df = df.head(300000)
+    if debug:
+        df = df.head(300000)
 
-    model = LGBMModel(output_dir=output_dir, logger=logger, exp_id="exp001")
+    model = LGBMModel(output_dir=output_dir, logger=logger, exp_id="exp001", debug=debug)
     model.train(df)
 
 if __name__ == "__main__":

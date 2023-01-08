@@ -64,13 +64,14 @@ class Config:
         raise ValueError
     step: int = 4
     extention: str = ".jpg"
-    negative_sample_ratio_close: float = 0.2
-    negative_sample_ratio_far: float = 0.2
+    negative_sample_ratio_close: float = 1
+    negative_sample_ratio_far: float = 1
+    negative_sample_ratio_g: float = 0.2
     base_dir: str = "../../output/preprocess/images"
     data_dir: str = f"../../output/preprocess/master_data_v2"
     image_path: str = "images_128x96_helmet"
     img_shape: Tuple[int, int] = (96, 128)
-    gradient_clipping: float = 1
+    gradient_clipping: float = 0.2
     exist_image_threshold: float = 0.1
     data_per_epoch: float = 1
     grayscale: bool = False
@@ -92,7 +93,6 @@ class Config:
     submission_mode: bool = False
 
     distance_threshold: float = 1.75
-    sep_is_g: bool = False
     calc_single_view_loss: bool = True
 
     calc_single_view_loss_weight: float = 0.5
@@ -103,9 +103,11 @@ class Config:
     fc_dropout: float = 0.2
     lr_reduce_ratio: float = 1
 
-    scheduler: str = "linear"
+    scheduler: str = "StepLR"
     step_size_ratio: float = 0.25
     gamma: float = 0.25
+    
+    pretrained: bool = True
 
 
 class NFLDataset(Dataset):
@@ -215,6 +217,8 @@ class NFLDataset(Dataset):
             distances = w_df["distance"].fillna(0).values
 
             for i in range(len(w_df)):
+
+                is_g = int(id_2 == "G")
                 if not self.test and i % self.config.use_data_step != 0:
                     continue
 
@@ -237,11 +241,12 @@ class NFLDataset(Dataset):
 
                 if not self.test and contacts[predict_frames_indice].sum() == 0:
                     # down sampling (only negative)
-                    if distances[i] < 0.75 and np.random.random() > self.config.negative_sample_ratio_close and id_2 != "G":
-                        continue
-                    if distances[i] >= 0.75 and np.random.random() > self.config.negative_sample_ratio_far:
-                        continue
-                    if id_2 == "G" and np.random.random() > self.config.negative_sample_ratio_far:
+                    if not is_g:
+                        if distances[i] < 0.75 and np.random.random() > self.config.negative_sample_ratio_close:
+                            continue
+                        if distances[i] >= 0.75 and np.random.random() > self.config.negative_sample_ratio_far:
+                            continue
+                    elif is_g and np.random.random() > self.config.negative_sample_ratio_g:
                         continue
 
                 if not self._exist_files(game_play=game_play, id_1=id_1, id_2=id_2, frames=frame_indice):
@@ -252,7 +257,10 @@ class NFLDataset(Dataset):
                         failed_count += 1
                         continue
 
-                contacts_all.append(contacts[predict_frames_indice].mean())
+                contacts_all.append({
+                    "is_g": is_g,
+                    "contact": contacts[predict_frames_indice].mean()
+                })
                 self.items.append({
                     "contact_id": contact_ids[predict_frames_indice],
                     "game_play": game_play,
@@ -260,12 +268,12 @@ class NFLDataset(Dataset):
                     "id_2": id_2,
                     "contact": contacts[predict_frames_indice],
                     "frames": frame_indice,
-                    "is_g": int(id_2 == "G"),
+                    "is_g": is_g,
                 })
-                is_g_count += int(id_2 == "G")
+                is_g_count += is_g
 
         logger.info(f"finished. extracted={len(self.items)} (total={len(df)}, is_g={is_g_count}, failed={failed_count})")
-        logger.info(f"contacts_distribution: \n {pd.Series(contacts_all).value_counts()}")
+        logger.info(f"contacts_distribution: \n {pd.DataFrame(contacts_all).groupby(['is_g', 'contact']).size()}")
 
     def __len__(self):
         return len(self.items)
@@ -577,7 +585,7 @@ class Model(nn.Module):
                  config: Config):
         super().__init__()
         self.config = config
-        self.cnn_2d = timm.create_model(config.model_name, num_classes=0, pretrained=True)
+        self.cnn_2d = timm.create_model(config.model_name, num_classes=0, pretrained=config.pretrained)
         self.seq_model = SequenceModel(
             hidden_size=self.cnn_2d.num_features,
             config=config
@@ -595,19 +603,17 @@ class Model(nn.Module):
     def forward(self, x, mask):
         bs, C, seq_len, W, H = x.shape
         x = x.permute(0, 2, 1, 3, 4)
-        x = torch.cat([
-            x[:, :seq_len//2].reshape(-1, C, W, H),
-            x[:, -seq_len//2:].reshape(-1, C, W, H)
-        ])  # shape = (bs*n_view*seq_len, C, W, H)
+        x = x.reshape(bs*seq_len, C, W, H)
 
         if "3dcnn" not in self.config.seq_model:
             x = self.cnn_2d(x)  # (bs*n_view*seq_len, features)
-            x = torch.cat([
-                x[:bs*(seq_len//2)].reshape(bs, seq_len//2, -1),  # (bs, seq_len, features)
-                x[-bs*(seq_len//2):].reshape(bs, seq_len//2, -1)  # (bs, seq_len, features)
-            ], dim=2)  # (bs, seq_len, n_view*feature)
-            x = self.seq_model(x)  # (bs, seq_len, n_view*features)
-            x = x.mean(dim=2)  # (bs, seq_len)
+            x = x.reshape(bs, 2, seq_len//2, -1).permute(0, 2, 1, 3)  # (bs, seq_len, n_view, feature)
+            x = x.reshape(bs, seq_len//2, -1)
+            if self.config.n_frames > 1:
+                x = self.seq_model(x)  # (bs, seq_len, n_view*features)
+                x = x.mean(dim=2)  # (bs, seq_len)
+            else:
+                x = x.squeeze(1)  # (bs, n_view*n_features)
             x = self.fc(x)  # (bs, seq_len, n_predict_frames)
 
         else:
@@ -635,10 +641,6 @@ class Model2p5D(nn.Module):
         self.config = config
         self.cnn_2d = timm.create_model(config.model_name.replace("cnn_2.5d_", ""), num_classes=0, pretrained=True,
                                         in_chans=self.config.n_frames)
-        self.seq_model = SequenceModel(
-            hidden_size=self.cnn_2d.num_features,
-            config=config
-        )
         if self.config.fc == "simple":
             self.fc = nn.LazyLinear(config.n_predict_frames)
         elif self.config.fc == "2layer":
@@ -652,27 +654,42 @@ class Model2p5D(nn.Module):
     def forward(self, x, mask):
         bs, _, seq_len, W, H = x.shape  # C = 1
         x = x.squeeze(1)  # (bs, n_view*seq_len, W, H)
-        x = torch.cat([
-            x[:, :seq_len//2],
-            x[:, -seq_len//2:]
-        ])
-        if "3dcnn" not in self.config.seq_model:
-            x = self.cnn_2d(x)  # (bs*n_view, features)
-            x = torch.cat([x[:bs], x[bs:]], dim=1)  # (bs, n_view*features)
-            x = self.fc(x)  # (bs, n_view*seq_len, n_predict_frames)
-
-        else:
-            raise NotImplementedError
-            x = self.cnn_2d.forward_features(x)  # (bs*n_view*seq_len, C', W', H')
-            _, C_, W_, H_ = x.shape
-            x = x.reshape(bs*2, seq_len//2, C_, W_, H_)  # (bs*n_view, seq_len, C_, W_, H_)
-            x = x.permute(0, 2, 1, 3, 4)  # (bs*n_view, C_, seq_len, W_, H_)
-            x = self.seq_model(x)  # (bs*2, seq_len, features)
-            x = F.adaptive_avg_pool3d(x, 1).squeeze(4).squeeze(3).squeeze(2)  # (bs*2, C)
-            x = x.reshape(bs, 2, -1)  # (bs, 2, C)
-            x = x.mean(dim=2)
-            x = self.fc(x)  # (bs, seq_len, n_predict_frames)
+        x = x.reshape(bs*2, seq_len//2, W, H)  # (bs*n_view, seq_len, W, H)
+        x = self.cnn_2d(x)  # (bs*n_view, features)
+        x = x.reshape(bs, -1)  # (bs, n_view*features)
+        x = self.fc(x)  # (bs, n_predict_frames)
         return x, None, None
+
+
+class Model2p5DTo3D(nn.Module):
+    def __init__(self,
+                 config: Config):
+        super().__init__()
+        self.config = config
+        self.cnn_2d = timm.create_model(config.model_name.replace("cnn_2.5d3d_", ""), num_classes=0, pretrained=True,
+                                        in_chans=self.config.n_frames)
+        if self.config.fc == "simple":
+            self.fc = nn.LazyLinear(config.n_predict_frames)
+        elif self.config.fc == "2layer":
+            self.fc = nn.Sequential(
+                nn.LazyLinear(32),
+                nn.Dropout(self.config.fc_dropout),
+                nn.GELU(),
+                nn.Linear(32, config.n_predict_frames)
+            )
+
+    def forward(self, x, mask):
+        bs, _, seq_len, W, H = x.shape  # C = 1
+        x = x.squeeze(1)  # (bs, n_view*seq_len, W, H)
+        x = x.reshape(bs*seq_len//3, 3, W, H)  # (bs*n_view*seq_len//3, 3, W, H)
+        x = self.cnn_2d(x)  # (bs*n_view*seq_len//3, features)
+        x = x.reshape(bs, 2, seq_len//3, -1)
+        # TODO: implements
+
+        x = x.reshape(bs, -1)  # (bs, n_view*features)
+        x = self.fc(x)  # (bs, n_predict_frames)
+        return x, None, None
+
 
 
 class Model3D(nn.Module):
@@ -696,57 +713,40 @@ class Model3D(nn.Module):
                 weights = MC3_18_Weights.DEFAULT
                 self.model = mc3_18(weights=weights)
                 self.model.fc = nn.Identity()
-        if self.config.sep_is_g:
-            self.fc_contact = nn.LazyLinear(config.n_predict_frames)
-            self.fc_g = nn.LazyLinear(config.n_predict_frames)
+        if self.config.calc_single_view_loss:
+            self.fc_endzone = nn.LazyLinear(config.n_predict_frames)
+            self.fc_sideline = nn.LazyLinear(config.n_predict_frames)
 
-            if self.config.calc_single_view_loss:
-                raise NotImplementedError
-        else:
-            if self.config.calc_single_view_loss:
-                self.fc_endzone = nn.LazyLinear(config.n_predict_frames)
-                self.fc_sideline = nn.LazyLinear(config.n_predict_frames)
-
-            if self.config.fc == "simple":
-                self.fc = nn.LazyLinear(config.n_predict_frames)
-            elif self.config.fc == "2layer":
-                self.fc = nn.Sequential(
-                    nn.LazyLinear(32),
-                    nn.Dropout(self.config.fc_dropout),
-                    nn.GELU(),
-                    nn.Linear(32, config.n_predict_frames)
-                )
+        if self.config.fc == "simple":
+            self.fc = nn.LazyLinear(config.n_predict_frames)
+        elif self.config.fc == "2layer":
+            self.fc = nn.Sequential(
+                nn.LazyLinear(32),
+                nn.Dropout(self.config.fc_dropout),
+                nn.GELU(),
+                nn.Linear(32, config.n_predict_frames)
+            )
 
     def forward(self, x, is_g):
         bs, C, seq_len, W, H = x.shape
         x = x.permute(0, 2, 1, 3, 4)  # (bs, n_view*seq_len, C, W, H)
         x = x.reshape(bs*2, seq_len//2, C, W, H)   # (bs*n_view, seq_len, C, W, H)
         x = x.permute(0, 2, 1, 3, 4)
+
+        # x[0] = EndZone[0], x[1] = SideLine[0]...  x[i] = EndZone[i//2], x[i+1] = SideLine[i//2]
         x = self.model(x)  # (bs*n_view, fc)
-        x = x.reshape(bs, 2, -1)  # (bs, 2, -1)
 
         x_endzone = None
         x_sideline = None
-        if not self.config.sep_is_g:
-            if self.config.calc_single_view_loss:
-                x_endzone = x[:, 0].reshape(bs, -1)
-                x_sideline = x[:, 1].reshape(bs, -1)
-                x = x.reshape(bs, -1)
+        if self.config.calc_single_view_loss:
+            x_endzone = self.fc_endzone(x[::2])
+            x_sideline = self.fc_sideline(x[1::2])
+            x = x.reshape(bs, -1)
+            x = self.fc(x)
 
-                x_endzone = self.fc_endzone(x_endzone)
-                x_sideline = self.fc_sideline(x_sideline)
-                x = self.fc(x)
-
-            else:
-                x = x.reshape(bs, -1)
-                x = self.fc(x)
         else:
             x = x.reshape(bs, -1)
-            x_contact = self.fc_contact(x)  # (bs, n_predict_frames)
-            x_g = self.fc_g(x)  # (bs, n_predict_frames)
-
-            not_is_g = (is_g == 0)
-            x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
+            x = self.fc(x)
 
         return x, x_endzone, x_sideline
 
@@ -788,8 +788,6 @@ def main(config):
                 config.calc_single_view_loss = False
             model = Model2p5D(config=config)
         else:
-            if config.sep_is_g:
-                raise NotImplementedError
             if config.calc_single_view_loss:
                 logger.info("calc_single_view_loss not be implemented")
                 config.calc_single_view_loss = False
@@ -963,122 +961,151 @@ def main(config):
 
 if __name__ == "__main__":
 
-    # MEMO: 1/5朝起きた時点で 128x96_v2に差し替えるぞ
-    # exp_name = f"3d_grayscale+helmet"
-    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 image_path="images_128x96_helmet", extention=".jpg",
-    #                 gradient_clipping=1, model_name="cnn_3d_r3d_18",
-    #                 epochs=2)
-    # main(config)
+    # for image_path in ["images_128x96_helmet"]:
     #
-    # for model_name in ["cnn_3d_mc3_18"]:
-    #     exp_name = f"3d_{model_name}"
-    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                     gradient_clipping=1, model_name=model_name,
-    #                     epochs=2)
-    #     main(config)
-    #
-    # for sample_ratio in [0.2, 0.1]:
-    #     exp_name = f"3d_neg_far{sample_ratio}_close{sample_ratio}"
-    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                     negative_sample_ratio_close=sample_ratio,
-    #                     negative_sample_ratio_far=sample_ratio,
-    #                     image_path="images_128x96_v2", extention=".jpg",
-    #                     gradient_clipping=1, model_name="cnn_3d_r3d_18",
-    #                     epochs=2)
-    #     main(config)
-
-    # for image_path in ["images_128x96_helmet", "images_128x96_v2"]:
     #     exp_name = f"2d_{image_path}"
-    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn",
+    #     config = Config(exp_name=exp_name, n_frames=1, seq_model="1dcnn",
     #                     model_name="tf_efficientnet_b0_ns",
-    #                     epochs=2, image_path=image_path)
-    #     main(config)
-    #
-    #     exp_name = f"3d_{image_path}"
-    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                     model_name="cnn_3d_r3d_18",
-    #                     epochs=2, image_path=image_path)
+    #                     image_path=image_path)
     #     main(config)
     #
     #     exp_name = f"2.5d_{image_path}"
     #     config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn",
     #                     model_name="cnn_2.5d_tf_efficientnet_b0_ns",
-    #                     epochs=2, image_path=image_path)
+    #                     image_path=image_path)
     #     main(config)
     #
-    # exp_name = f"3d_lr_reduce_ratio_0.1"
-    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 lr_reduce_ratio=0.1,
-    #                 epochs=2)
-    # main(config)
+    #     exp_name = f"2d_{image_path}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn",
+    #                     model_name="tf_efficientnet_b0_ns",
+    #                     image_path=image_path)
+    #     main(config)
     #
-    # for weight_decay in [0.1, 0.01]:
-    #     exp_name = f"3d_weight_decay{weight_decay}"
+    #     exp_name = f"3d_{image_path}"
     #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                     weight_decay=weight_decay,
-    #                     epochs=2)
-    #     main(config)
-    #
-    # for gradient_clipping in [0.2]:
-    #     exp_name = f"3d_gradient_clipping{gradient_clipping}"
-    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                     gradient_clipping=gradient_clipping,
-    #                     epochs=2)
+    #                     model_name="cnn_3d_r3d_18",
+    #                     image_path=image_path)
     #     main(config)
 
-    # exp_name = f"3d_num_training_step5000"
+    # # ----------------
+    # # 3D
+    # # ----------------
+    # exp_name = f"3d_stepLR negative_G=0.05"
     # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 num_training_steps=5000,
-    #                 gradient_clipping=1, model_name="cnn_3d_r3d_18",
-    #                 epochs=1)
+    #                 model_name="cnn_3d_r3d_18",
+    #                 negative_sample_ratio_g=0.05, epochs=2)
     # main(config)
-
     #
-    # exp_name = f"3d_fc_dropout"
+    # exp_name = f"3d_stepLR stepsize0.5_gamma0.25"
     # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 num_training_steps=5000,
-    #                 gradient_clipping=0.2,
-    #                 epochs=1)
+    #                 model_name="cnn_3d_r3d_18",
+    #                 step_size_ratio=0.5, gamma=0.25, epochs=2)
+    # main(config)
+    #
+    # exp_name = f"3d_stepLR negative_contact=1"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 model_name="cnn_3d_r3d_18",
+    #                 negative_sample_ratio_far=1,
+    #                 negative_sample_ratio_close=1)
+    # main(config)
+    #
+    # # ----------------
+    # # 2.5D
+    # # ----------------
+    # for lr in [3e-5, 3e-4]:
+    #     exp_name = f"2.5d_lr={lr}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn",
+    #                     model_name="cnn_2.5d_tf_efficientnet_b0_ns", lr=lr, epochs=2)
+    #     main(config)
+    #
+    # for n_frames in [9, 15, 63]:
+    #     exp_name = f"2.5d_n_frames={n_frames}"
+    #     config = Config(exp_name=exp_name, n_frames=n_frames, seq_model="1dcnn",
+    #                     model_name="cnn_2.5d_tf_efficientnet_b0_ns")
+    #     main(config)
+    #
+    # for step_size_ratio in [0.25, 0.5]:
+    #     exp_name = f"2.5d_stepsize{step_size_ratio}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn",
+    #                     model_name="cnn_2.5d_tf_efficientnet_b0_ns",
+    #                     step_size_ratio=step_size_ratio, epochs=2)
+    #     main(config)
+    #
+    # for use_data_step in [2, 3, 4]:
+    #     exp_name = f"2.5d_use_data_step{use_data_step}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn",
+    #                     model_name="cnn_2.5d_tf_efficientnet_b0_ns",
+    #                     use_data_step=use_data_step, epochs=2)
+    #     main(config)
+    #
+    #
+
+    # ----------------
+    # 2.5D
+    # ----------------
+    # for cnn2d in ["tf_efficientnetv2_b0", "tf_efficientnetv2_b1"]:
+    #     exp_name = f"2.5d_cnn2d={cnn2d}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn",
+    #                     model_name=f"cnn_2.5d_{cnn2d}", epochs=2)
+    #     main(config)
+    #
+    # for lr in [1e-3, 1e-4]:
+    #     exp_name = f"2.5d_lr={lr}_pretrained=False"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="1dcnn", pretrained=False,
+    #                     negative_sample_ratio_close=1,
+    #                     negative_sample_ratio_far=1,
+    #                     negative_sample_ratio_g=1,
+    #                     model_name="cnn_2.5d_tf_efficientnet_b0_ns", lr=lr, epochs=2)
+    #     main(config)
+
+    # ----------------
+    # 3D
+    # ----------------
+    # exp_name = f"3d_stepLR negative_contact=1_lr3e-4"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 model_name="cnn_3d_r3d_18",
+    #                 lr=3e-4,
+    #                 negative_sample_ratio_far=1,
+    #                 negative_sample_ratio_close=1)
+    # main(config)
+    # exp_name = f"3d_stepLR disable negative sample"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 model_name="cnn_3d_r3d_18",
+    #                 negative_sample_ratio_g=1,
+    #                 negative_sample_ratio_far=1,
+    #                 negative_sample_ratio_close=1)
+    # main(config)
+    #
+    # exp_name = f"3d_stepLR negative_contact=1_lr5e-5"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 model_name="cnn_3d_r3d_18",
+    #                 lr=5e-5,
+    #                 negative_sample_ratio_far=1,
+    #                 negative_sample_ratio_close=1)
     # main(config)
 
-    # exp_name = f"3d_steplr"
-    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 scheduler="StepLR", gradient_clipping=0.2, epochs=1)
-    # main(config)
-
-    for step_size_ratio in [0.4, 0.5]:
-        exp_name = f"3d_steplr_step_size_ratio{step_size_ratio}"
-        config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-                        scheduler="StepLR", gradient_clipping=0.2, epochs=2,
-                        step_size_ratio=step_size_ratio)
-        main(config)
-    exp_name = f"3d_close1"
+    exp_name = f"3d_v3"
     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-                    negative_sample_ratio_close=1, gradient_clipping=0.2, epochs=1)
+                    negative_sample_ratio_far=1,
+                    negative_sample_ratio_close=1,
+                    negative_sample_ratio_g=1,
+                    model_name="cnn_3d_r3d_18",
+                    image_path="images_128x96_v3")
     main(config)
-
-
-    # exp_name = f"3d_nframes63_step2"
-    # config = Config(exp_name=exp_name, n_frames=63, seq_model="flatten",
-    #                 step=2,
-    #                 gradient_clipping=1, model_name="cnn_3d_r3d_18",
-    #                 epochs=2)
-    # main(config)
-    #
-    # exp_name = f"3d_num_training_step5000"
+    # exp_name = f"3d_stepLR negative_contact=1_stepsize0.5_gamma0.5"
     # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 num_training_steps=5000,
-    #                 gradient_clipping=1, model_name="cnn_3d_r3d_18",
-    #                 epochs=1)
-    # main(config)
-    #
-    # exp_name = f"3d_num_training_step10000"
-    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 num_training_steps=10000,
-    #                 gradient_clipping=1, model_name="cnn_3d_r3d_18",
-    #                 epochs=2)
+    #                 model_name="cnn_3d_r3d_18",
+    #                 negative_sample_ratio_far=1,
+    #                 negative_sample_ratio_close=1,
+    #                 negative_sample_ratio_g=1,
+    #                 step_size_ratio=0.5, gamma=0.5, epochs=2)
     # main(config)
 
+    exp_name = f"3d_stepLR negative_g=0.05_stepsize0.5_gamma0.5"
+    config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+                    model_name="cnn_3d_r3d_18",
+                    negative_sample_ratio_g=0.05,
+                    step_size_ratio=0.5, gamma=0.5, epochs=2)
+    main(config)
 
 
