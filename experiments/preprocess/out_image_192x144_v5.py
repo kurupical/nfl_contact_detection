@@ -9,12 +9,12 @@ RED = (0, 0, 255)
 WHITE = (255, 255, 255)
 BLUE = (255, 0, 0)
 GREEN = (0, 255, 0)
-output_size = (128, 128)
-output_dir = f"../../output/preprocess/images/images_{output_size[0]}x{output_size[1]}_v4"
+output_size = (192, 144)
+output_dir = f"../../output/preprocess/images/images_{output_size[0]}x{output_size[1]}_v5"
 traintest = "train"
 
-bbox_left_ratio = 4.5
-bbox_right_ratio = 4.5
+bbox_left_ratio = 7
+bbox_right_ratio = 7
 bbox_top_ratio = 6
 bbox_down_ratio = 3
 
@@ -174,9 +174,40 @@ def main():
                     top = int(series["y"] + series["height"] * bbox_top_ratio)
                     down = int(series["y"] - series["height"] * bbox_down_ratio)
 
-                    left = max(0, left)
-                    down = max(0, down)
-
+                    out_fname = f"{output_dir}/{game_play}/{view}/{key[0]}_{key[1]}_{frame}.jpg"
+                    # pad処理
+                    left_pad = 0
+                    down_pad = 0
+                    if left < 0:
+                        # print(f"left < 0 (left = {left}): {out_fname}")
+                        img = np.concatenate([
+                            np.zeros((img.shape[0], np.abs(left), 3), dtype=np.uint8) + 128,
+                            img
+                        ], axis=1)
+                        left_pad = np.abs(left)
+                        right += np.abs(left)
+                        left = 0
+                    if right >= img.shape[1]:
+                        # print(f"right > img.shape[0] (right = {right}): {out_fname}")
+                        img = np.concatenate([
+                            img,
+                            np.zeros((img.shape[0], right - img.shape[1] + 1, 3), dtype=np.uint8) + 128,
+                        ], axis=1)
+                    if down < 0:
+                        # print(f"down < 0 (down = {down}): {out_fname}")
+                        img = np.concatenate([
+                            np.zeros((np.abs(down), img.shape[1], 3), dtype=np.uint8) + 128,
+                            img
+                        ], axis=0)
+                        down_pad = np.abs(down)
+                        top += np.abs(down)
+                        down = 0
+                    if top >= img.shape[0]:
+                        # print(f"top > img.shape[0] (right = {right}): {out_fname}")
+                        img = np.concatenate([
+                            img,
+                            np.zeros((top - img.shape[0] + 1, img.shape[1], 3), dtype=np.uint8) + 128,
+                        ], axis=0)
                     img = img[down:top, left:right]
                     img_filter = img.copy()
                     for player_id in [1, 2]:
@@ -192,10 +223,10 @@ def main():
                         elif player_id == 2 and series["team_1"] != series["team_2"]:
                             box_color = BLUE
 
-                        box_left = max(0, int(series[f"left_{player_id}"]) - left)
-                        box_right = max(min(img.shape[1], int(series[f"left_{player_id}"] + series[f"width_{player_id}"]) - left), 0)
-                        box_top = max(0, int(series[f"top_{player_id}"]) - down)
-                        box_down = max(min(img.shape[0], int(series[f"top_{player_id}"] + series[f"height_{player_id}"]) - down), 0)
+                        box_left = max(0, int(series[f"left_{player_id}"]) - left + left_pad)
+                        box_right = max(min(img.shape[1], int(series[f"left_{player_id}"] + series[f"width_{player_id}"]) - left + left_pad), 0)
+                        box_top = max(0, int(series[f"top_{player_id}"]) - down + down_pad)
+                        box_down = max(min(img.shape[0], int(series[f"top_{player_id}"] + series[f"height_{player_id}"]) - down + down_pad), 0)
                         cv2.rectangle(
                             img_filter,
                             (box_left, box_top),
@@ -212,7 +243,6 @@ def main():
                     # img = (img*0.7 + img_filter*0.3).astype(np.uint8)
 
                     img = cv2.resize(img, dsize=output_size)
-                    out_fname = f"{output_dir}/{game_play}/{view}/{key[0]}_{key[1]}_{frame}.jpg"
                     os.makedirs(os.path.dirname(out_fname), exist_ok=True)
                     cv2.imwrite(out_fname, img)
             vidcap.release()

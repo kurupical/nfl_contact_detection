@@ -1,5 +1,5 @@
 
 cd cnn_2d
-python exp019.py
-python exp018.py
+python exp027.py
+python exp028.py
 

@@ -86,12 +86,13 @@ df_tracking["nfl_player_id"] = df_tracking["nfl_player_id"].astype(str)
 game_plays = df_labels["game_play"].drop_duplicates().values
 
 df_helmets_concat = []
-for key, df_ in tqdm.tqdm(df_helmets.groupby(["game_play", "view", "nfl_player_id"])):
+for key, df_ in tqdm.tqdm(df_helmets.groupby(["game_play", "view", "nfl_player_id", "team"])):
     frame_min = df_["frame"].min()
     frame_max = df_["frame"].max()
     game_play = key[0]
     view = key[1]
     nfl_player_id = key[2]
+    team = key[3]
 
     df_ = pd.merge(
         pd.DataFrame({"frame": np.arange(frame_min, frame_max + 1)}).astype(int),
@@ -101,16 +102,10 @@ for key, df_ in tqdm.tqdm(df_helmets.groupby(["game_play", "view", "nfl_player_i
     df_["game_play"] = game_play
     df_["nfl_player_id"] = nfl_player_id
     df_["view"] = view
-    for col in ["x", "y", "left", "top", "width", "height"]:
-        df_[col] = df_[col].interpolate(limit=5, limit_area="inside")
+    df_["team"] = team
     df_helmets_concat.append(df_)
 
-df_helmets = pd.concat(df_helmets_concat).reset_index(drop=True)
-
-output_dir = "../../output/preprocess/master_data_v3/"
-os.makedirs(output_dir, exist_ok=True)
-
-df_helmets.to_feather(f"{output_dir}/helmets.feather")
+df_helmets = pd.concat(df_helmets_concat)
 
 gps = []
 
@@ -147,4 +142,6 @@ gps["distance"] = np.sqrt(
 
 print(gps.isnull().sum() / len(gps))
 gps["frame"] = gps["frame"].fillna(99999).astype(int)
+output_dir = "../../output/preprocess/master_data_v3/"
+os.makedirs(output_dir, exist_ok=True)
 gps.reset_index(drop=True).to_feather(f"{output_dir}/gps.feather")
