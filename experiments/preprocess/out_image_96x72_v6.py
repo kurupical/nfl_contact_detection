@@ -9,12 +9,12 @@ RED = (0, 0, 255)
 WHITE = (255, 255, 255)
 BLUE = (255, 0, 0)
 GREEN = (0, 255, 0)
-output_size = (128, 96)
+output_size = (96, 72)
 output_dir = f"../../output/preprocess/images/images_{output_size[0]}x{output_size[1]}_v6"
 traintest = "train"
 
-bbox_left_ratio = 4.5
-bbox_right_ratio = 4.5
+bbox_left_ratio = 4
+bbox_right_ratio = 4
 bbox_top_ratio = 4
 bbox_down_ratio = 2
 
@@ -123,7 +123,6 @@ def main():
     for i, game_play in enumerate(tqdm.tqdm(game_plays)):
         if i < 170:
             continue
-
         gp = join_helmets_contact(game_play, df_labels, df_helmets, df_meta)
         for col in ["x", "y", "width", "height"]:
             gp[col] = gp[[f"{col}_1", f"{col}_2"]].mean(axis=1)

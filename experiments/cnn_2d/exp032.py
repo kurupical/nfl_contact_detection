@@ -18,6 +18,7 @@ from torchvision.io.video import read_video
 try:
     from torchvision.models.video import r3d_18, R3D_18_Weights, mc3_18, MC3_18_Weights
     import mlflow
+    import wandb
 except Exception as e:
     print(e)
     from torchvision.models.video import r3d_18
@@ -115,7 +116,6 @@ class Config:
     dilation_3d: Tuple[int, int, int] = (1, 1, 1)
     dropout_3d: float = 0.2
 
-
     transforms_train: A.Compose = A.Compose([
         A.HorizontalFlip(p=0.5),
         A.RandomGamma(p=0.25),
@@ -128,6 +128,8 @@ class Config:
     interpolate_image: bool = True
 
     g_embedding: bool = False
+    custom_3d: bool = False
+    kernel_custom_3d: Tuple[int, int, int] = (2, 3, 3)
 
 
 class NFLDataset(Dataset):
@@ -392,15 +394,6 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
-
-def log_loss(loss_history, loss_meter, loss, batch_size, name, mode, step):
-    loss_history.append(loss)
-    loss_history = loss_history[-100:]
-    loss_meter.update(np.mean(loss_history), batch_size)
-    mlflow.log_metric(f"{mode}_{name}", loss_meter.avg, step=step)
-    mlflow.log_metric(f"{mode}_{name}_snap", np.mean(loss_history), step=step)
-
-
 def train_fn(dataloader, model, criterion, optimizer, device, scheduler, epoch, config):
     model.train()
     loss_meter = AverageMeter()
@@ -442,17 +435,23 @@ def train_fn(dataloader, model, criterion, optimizer, device, scheduler, epoch, 
         scaler.update()
         scheduler.step()
 
-        log_loss(loss_history=loss_100, loss_meter=loss_meter, loss=loss.detach().item(),
-                 batch_size=batch_size, name="loss", mode="train", step=data_length*epoch+count)
+        loss_meter.update(loss.detach().item(), batch_size)
         if config.calc_single_view_loss:
-            log_loss(loss_history=loss_concat_100, loss_meter=loss_concat_meter, loss=loss_concat.detach().item(),
-                     batch_size=batch_size, name="loss_concat", mode="train", step=data_length*epoch+count)
-            log_loss(loss_history=loss_endzone_100, loss_meter=loss_endzone_meter, loss=loss_endzone.detach().item(),
-                     batch_size=batch_size, name="loss_endzone", mode="train", step=data_length*epoch+count)
-            log_loss(loss_history=loss_sideline_100, loss_meter=loss_sideline_meter, loss=loss_sideline.detach().item(),
-                     batch_size=batch_size, name="loss_sideline", mode="train", step=data_length*epoch+count)
-
-        mlflow.log_metric("lr", optimizer.param_groups[0]['lr'], step=data_length*epoch+count)
+            loss_concat_meter.update(loss_concat.detach().item(), batch_size)
+            loss_endzone_meter.update(loss_endzone.detach().item(), batch_size)
+            loss_sideline_meter.update(loss_sideline.detach().item(), batch_size)
+            wandb.log({
+                "loss": loss_meter.avg,
+                "loss_concat": loss_concat_meter.avg,
+                "loss_endzone": loss_endzone_meter.avg,
+                "loss_sideline": loss_sideline_meter.avg,
+                "lr": optimizer.param_groups[0]['lr']
+            })
+        else:
+            wandb.log({
+                "loss": loss_meter.avg,
+                "lr": optimizer.param_groups[0]['lr']
+            })
         tk0.set_postfix(Loss=loss_meter.avg,
                         LossSnap=np.mean(loss_100),
                         LossCat=loss_concat_meter.avg,
@@ -551,6 +550,33 @@ class SimpleConv3d(nn.Module):
     def forward(self, x):
         x = self.do(F.relu(self.bn(self.fc(x))))
         return x
+
+
+class SlowFastConv3d(nn.Module):
+    def __init__(self,
+                 config: Config):
+        super(SlowFastConv3d, self).__init__()
+        hid = config.hidden_size_3d
+        self.fc_slow = nn.LazyConv3d(hid,
+                                     config.kernel_size_3d,
+                                     bias=False,
+                                     stride=config.stride_3d,
+                                     padding=(0, 1, 1),
+                                     dilation=(1, 1, 1))
+        self.fc_fast = nn.LazyConv3d(hid,
+                                     config.kernel_size_3d,
+                                     bias=False,
+                                     stride=config.stride_3d,
+                                     padding=(0, 1, 1),
+                                     dilation=(2, 1, 1))
+        self.bn = nn.BatchNorm3d(hid)
+        self.do = nn.Dropout(config.dropout_3d)
+        self.num_features = hid
+
+    def forward(self, x):
+        x_slow = self.do(F.relu(self.bn(self.fc_slow(x))))
+        x_fast = self.do(F.relu(self.bn(self.fc_fast(x))))
+        return x_slow, x_fast
 
 
 class ThreeLayerConv3d(nn.Module):
@@ -758,6 +784,9 @@ class Model2p5DTo3D(nn.Module):
             self.seq_model = SimpleConv3d(config=config)
         elif config.seq_model == "3dcnn_3layers":
             self.seq_model = ThreeLayerConv3d(config=config)
+        elif config.seq_model == "3dcnn_slowfast":
+            self.seq_model = SlowFastConv3d(config=config)
+
         if self.config.fc == "simple":
             self.fc = nn.LazyLinear(config.n_predict_frames)
         elif self.config.fc == "2layer":
@@ -784,7 +813,13 @@ class Model2p5DTo3D(nn.Module):
         x = x.reshape(bs*2, (seq_len//6), C_, W_, H_)  # (bs*n_view, seq_len//3, C, W, H)
         x = self.seq_model(x)  # (bs*n_view*seq_len//3, feature)
 
-        x = F.adaptive_avg_pool3d(x, 1).squeeze(4).squeeze(3).squeeze(2)
+        if self.config.seq_model == "3dcnn_slowfast":
+            x_slow = F.adaptive_avg_pool3d(x[0], 1).squeeze(4).squeeze(3).squeeze(2)
+            x_fast = F.adaptive_avg_pool3d(x[1], 1).squeeze(4).squeeze(3).squeeze(2)
+            x = torch.cat([x_slow, x_fast], dim=1)
+
+        else:
+            x = F.adaptive_avg_pool3d(x, 1).squeeze(4).squeeze(3).squeeze(2)
 
         x_endzone = None
         x_sideline = None
@@ -819,6 +854,13 @@ class Model3D(nn.Module):
                 weights = R3D_18_Weights.DEFAULT
                 self.model = r3d_18(weights=weights)
                 self.model.fc = nn.Identity()
+            if self.config.custom_3d:
+                self.model.stem[0] = nn.Conv3d(
+                    3, 64,
+                    kernel_size=self.config.kernel_custom_3d,
+                    stride=(1, 2, 2),
+                    padding=(1, 3, 3)
+                )
         elif self.config.model_name == "cnn_3d_mc3_18":
             if self.config.submission_mode:
                 self.model = mc3_18()
@@ -910,12 +952,12 @@ class FocalLoss(nn.Module):
         return loss
 
 
-def calc_best(label, pred, logger):
+def calc_best(label, pred, logger, epoch, name):
     best_th = -1
     best_score = -1
     auc = roc_auc_score(label, pred)
     logger.info(f"\nauc: {auc}")
-    mlflow.log_metric("auc", auc)
+    wandb.log({f"auc_{name}": auc})
     for th in np.arange(0, 1, 0.05):
         score = matthews_corrcoef(label, pred > th)
 
@@ -1064,159 +1106,176 @@ def main(config):
             scheduler = LambdaLR(optimizer=optimizer, lr_lambda=lr_lambda)
 
         results = []
-        mlflow.set_tracking_uri('../../mlruns/')
+        wandb.init(project="nfl_contact", name=config.exp_name, reinit=True)
 
-        with mlflow.start_run(run_name=config.exp_name):
-            for k, v in config.__dict__.items():
-                mlflow.log_param(k, v)
+        for k, v in config.__dict__.items():
+            wandb.config.update({k: v})
 
-            mlflow.log_metric("MCC_all", possible_score_all)
-            mlflow.log_metric("MCC_extracted", possible_score_extracted)
-            mlflow.log_param("output_dir", output_dir)
-            total_best_score = -1
-            total_best_auc = -1
-            for epoch in range(config.epochs):
-                logger.info(f"===============================")
-                logger.info(f"epoch {epoch + 1}")
-                logger.info(f"===============================")
-                train_loss = train_fn(
-                    train_loader,
-                    model,
-                    criterion,
-                    optimizer,
-                    device,
-                    scheduler,
-                    epoch,
-                    config,
-                )
+        wandb.log({
+            "MCC_all": possible_score_all,
+            "MCC_extracted": possible_score_extracted,
+        })
+        wandb.config.update({"output_dir": output_dir})
+        total_best_score = -1
+        total_best_auc = -1
+        for epoch in range(config.epochs):
+            logger.info(f"===============================")
+            logger.info(f"epoch {epoch + 1}")
+            logger.info(f"===============================")
+            train_loss = train_fn(
+                train_loader,
+                model,
+                criterion,
+                optimizer,
+                device,
+                scheduler,
+                epoch,
+                config,
+            )
 
-                df_pred, valid_loss = eval_fn(
-                    val_loader,
-                    model,
-                    criterion,
-                    device,
-                    config
-                )
+            df_pred, valid_loss = eval_fn(
+                val_loader,
+                model,
+                criterion,
+                device,
+                config
+            )
 
-                df_label = pd.read_csv("../../input/nfl-player-contact-detection/train_labels.csv")
-                df_label["game_key"] = [int(x.split("_")[0]) for x in df_label["contact_id"].values]
-                for train_idx, val_idx in gkfold.split(df_label, groups=df_label["game_key"].values):
-                    df_label_val = df_label.iloc[val_idx]
-                    break
+            df_label = pd.read_csv("../../input/nfl-player-contact-detection/train_labels.csv")
+            df_label["game_key"] = [int(x.split("_")[0]) for x in df_label["contact_id"].values]
+            for train_idx, val_idx in gkfold.split(df_label, groups=df_label["game_key"].values):
+                df_label_val = df_label.iloc[val_idx]
+                break
 
-                scheduler.base_lrs = [lr_ * config.lr_reduce_ratio for lr_ in scheduler.base_lrs]
-                df_merge = pd.merge(df_label_val, df_pred, how="left")
+            scheduler.base_lrs = [lr_ * config.lr_reduce_ratio for lr_ in scheduler.base_lrs]
+            df_merge = pd.merge(df_label_val, df_pred, how="left")
 
-                logger.info(f"loss: train {train_loss}, val {valid_loss}")
-                logger.info(f"------ MCC ------")
-                df_score = df_merge.groupby(["contact_id", "contact"], as_index=False)["score"].apply(np.mean)
+            logger.info(f"loss: train {train_loss}, val {valid_loss}")
+            logger.info(f"------ MCC ------")
+            df_score = df_merge.groupby(["contact_id", "contact"], as_index=False)["score"].apply(np.mean)
 
-                logger.info(f"[all]")
-                label = df_score["contact"].values
-                pred = df_score["score"].fillna(0).values
-                auc, best_th, best_score = calc_best(label, pred, logger)
+            logger.info(f"[all]")
+            label = df_score["contact"].values
+            pred = df_score["score"].fillna(0).values
+            auc, best_th, best_score = calc_best(label, pred, logger, epoch, name="all")
 
-                logger.info(f"\n[G]")
-                w_df = df_score[df_score["contact_id"].str.contains("G")]
-                label = w_df["contact"].values
-                pred = w_df["score"].fillna(0).values
-                _, _, best_score_g = calc_best(label, pred, logger)
+            logger.info(f"\n[G]")
+            w_df = df_score[df_score["contact_id"].str.contains("G")]
+            label = w_df["contact"].values
+            pred = w_df["score"].fillna(0).values
+            _, _, best_score_g = calc_best(label, pred, logger, epoch, name="g")
 
-                logger.info(f"\n[Contact]")
-                w_df = df_score[~df_score["contact_id"].str.contains("G")]
-                label = w_df["contact"].values
-                pred = w_df["score"].fillna(0).values
-                _, _, best_score_contact = calc_best(label, pred, logger)
+            logger.info(f"\n[Contact]")
+            w_df = df_score[~df_score["contact_id"].str.contains("G")]
+            label = w_df["contact"].values
+            pred = w_df["score"].fillna(0).values
+            _, _, best_score_contact = calc_best(label, pred, logger, epoch, name="contact")
 
-                logger.info(f"***************** epoch {epoch} *****************")
-                logger.info(f"best: {best_score} (th={best_th})")
-                logger.info(f"******************************************")
-                pd.merge(df_label_val, df_pred, how="left").to_csv(f"{output_dir}/pred_{epoch}.csv", index=False)
-                if not config.debug:
-                    torch.save(model.state_dict(), f"{output_dir}/epoch{epoch}.pth")
+            logger.info(f"***************** epoch {epoch} *****************")
+            logger.info(f"best: {best_score} (th={best_th})")
+            logger.info(f"******************************************")
+            pd.merge(df_label_val, df_pred, how="left").to_csv(f"{output_dir}/pred_{epoch}.csv", index=False)
+            if not config.debug:
+                torch.save(model.state_dict(), f"{output_dir}/epoch{epoch}.pth")
 
-                results.append({
-                    "epoch": epoch,
-                    "score": best_score,
-                    "train_loss": train_loss,
-                    "val_loss": valid_loss,
-                    "th": best_th,
+            results.append({
+                "epoch": epoch,
+                "score": best_score,
+                "train_loss": train_loss,
+                "val_loss": valid_loss,
+                "th": best_th,
+            })
+            wandb.log({
+                "val_loss": valid_loss,
+                "score": best_score,
+                "score_g": best_score_g,
+                "score_contact": best_score_contact,
+                "epoch": 0,
+            })
+            if total_best_score < best_score:
+                total_best_score = best_score
+                total_best_auc = auc
+                wandb.log({
+                    "best_score": total_best_score,
+                    "best_auc": total_best_auc,
+                    "threshold": best_th,
+                    "epoch": 0,
                 })
-                mlflow.log_metric("val_loss", valid_loss)
-                mlflow.log_metric("score", best_score)
-                mlflow.log_metric("score_g", best_score_g)
-                mlflow.log_metric("score_contact", best_score_contact)
 
-                if total_best_score < best_score:
-                    total_best_score = best_score
-                    total_best_auc = auc
-                    mlflow.log_metric("best_score", total_best_score)
-                    mlflow.log_metric("best_auc", total_best_auc)
-                    mlflow.log_metric("threshold", best_th)
-
-                pd.DataFrame(results).to_csv(f"{output_dir}/results.csv", index=False)
+            pd.DataFrame(results).to_csv(f"{output_dir}/results.csv", index=False)
+        wandb.finish()
     except Exception as e:
         print(e)
-        raise
 
 
 if __name__ == "__main__":
+    # exp_name = f"2.5d3d_wd0.1_hidden512_resnext26_slowfast"
+    # config = Config(exp_name=exp_name, n_frames=33, seq_model="3dcnn_slowfast",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnext26_32x4d", epochs=1,
+    #                 negative_sample_ratio_g=1,
+    #                 negative_sample_ratio_far=1,
+    #                 negative_sample_ratio_close=1,
+    #                 hidden_size_3d=512,
+    #                 weight_decay=0.1,
+    #                 )
+    # main(config)
+    #
+    # for kernel_size_3d in [(7, 5, 5), (5, 2, 2), (3, 2, 2)]:
+    #     exp_name = f"2.5d3d_kernel_size_3d{kernel_size_3d}"
+    #     config = Config(
+    #         exp_name=exp_name, n_frames=33, seq_model="3dcnn_simple",
+    #         model_name=f"cnn_2.5d3d_legacy_seresnext26_32x4d", epochs=1,
+    #         negative_sample_ratio_g=1,
+    #         negative_sample_ratio_far=1,
+    #         negative_sample_ratio_close=1,
+    #         kernel_size_3d=kernel_size_3d,
+    #         stride_3d=(1, 1, 1),
+    #     )
+    #     main(config)
+    #
+    # exp_name = f"2.5d3d_dilation2_nframes33"
+    # config = Config(exp_name=exp_name, n_frames=33, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnext26_32x4d", epochs=1,
+    #                 negative_sample_ratio_g=1,
+    #                 negative_sample_ratio_far=1,
+    #                 negative_sample_ratio_close=1,
+    #                 weight_decay=0.1,
+    #                 hidden_size_3d=512,
+    #                 dilation_3d=(2, 1, 1),
+    #                 stride_3d=(1, 1, 1),
+    #                 )
+    # main(config)
 
-    exp_name = f"2.5d3d_g_embedding"
-    config = Config(exp_name=exp_name, n_frames=33, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1,
-                    negative_sample_ratio_g=1,
-                    negative_sample_ratio_far=1,
-                    negative_sample_ratio_close=1,
-                    g_embedding=True,
-                    )
-    main(config)
+    # exp_name = f"2.5d3d_wd0.1_hidden512_resnext26_slowfast_stride2"
+    # config = Config(exp_name=exp_name, n_frames=33, seq_model="3dcnn_slowfast",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnext26_32x4d", epochs=1,
+    #                 negative_sample_ratio_g=1,
+    #                 negative_sample_ratio_far=1,
+    #                 negative_sample_ratio_close=1,
+    #                 hidden_size_3d=512,
+    #                 weight_decay=0.1,
+    #                 stride_3d=(1, 1, 1),
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_wd0.1_hidden512_resnext26"
+    # config = Config(exp_name=exp_name, n_frames=33, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnext26_32x4d", epochs=1,
+    #                 negative_sample_ratio_g=1,
+    #                 negative_sample_ratio_far=1,
+    #                 negative_sample_ratio_close=1,
+    #                 hidden_size_3d=512,
+    #                 weight_decay=0.1,
+    #                 )
+    # main(config)
+    #
 
-    exp_name = f"2.5d3d_wd0.1_hidden512_resnext26"
-    config = Config(exp_name=exp_name, n_frames=33, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnext26_32x4d", epochs=1,
-                    negative_sample_ratio_g=1,
-                    negative_sample_ratio_far=1,
-                    negative_sample_ratio_close=1,
-                    hidden_size_3d=512,
-                    weight_decay=0.1,
-                    )
-    main(config)
-
-    for kernel_size_3d in [(7, 5, 5), (5, 2, 2), (3, 2, 2)]:
-        exp_name = f"2.5d3d_kernel_size_3d{kernel_size_3d}"
-        config = Config(
-            exp_name=exp_name, n_frames=33, seq_model="3dcnn_simple",
-            model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1,
-            negative_sample_ratio_g=1,
-            negative_sample_ratio_far=1,
-            negative_sample_ratio_close=1,
-            kernel_size_3d=kernel_size_3d,
-            stride_3d=(1, 1, 1),
-        )
-        main(config)
-
-    exp_name = f"2.5d3d_dilation2_nframes33"
-    config = Config(exp_name=exp_name, n_frames=33, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1,
-                    negative_sample_ratio_g=1,
-                    negative_sample_ratio_far=1,
-                    negative_sample_ratio_close=1,
-                    weight_decay=0.1,
-                    hidden_size_3d=512,
-                    dilation_3d=(2, 1, 1),
-                    stride_3d=(1, 1, 1),
-                    )
-    main(config)
-
-    exp_name = f"2.5d3d_hidden512_weight_decay0.1"
-    config = Config(exp_name=exp_name, n_frames=33, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1,
-                    negative_sample_ratio_g=1,
-                    negative_sample_ratio_far=1,
-                    negative_sample_ratio_close=1,
-                    weight_decay=0.1,
-                    hidden_size_3d=512
-                    )
+    exp_name = f"3d_v4_kernel(3, 5, 5)"
+    config = Config(
+        exp_name=exp_name, n_frames=31, seq_model="flatten",
+        model_name="cnn_3d_r3d_18",
+        custom_3d=True,
+        kernel_custom_3d=(3, 5, 5)
+    )
     main(config)
 

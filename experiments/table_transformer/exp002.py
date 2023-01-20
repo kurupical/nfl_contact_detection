@@ -79,11 +79,11 @@ class Config:
     num_training_steps: int = 100000
 
     # transformer
-    hidden_size_transformer: int = 10  # TODO: exp002に合わせて
-    num_layer_transformer: int = 2
-    nhead: int = 2
+    hidden_size_transformer: int = 128  # TODO: exp002に合わせて
+    num_layer_transformer: int = 3
+    nhead: int = 8
     num_layer_rnn: int = 1
-    feature_dir: str = "../../output/preprocess/feature/exp009/feature_len9443236.feather"
+    feature_dir: str = "../../output/preprocess/feature/exp010/feature_len9443236.feather"
     max_length: int = 192
 
     # 2d_cnn
@@ -95,8 +95,6 @@ class Config:
     hidden_size_1d: int = 32
 
     submission_mode: bool = False
-
-
 
 class NFLDataset(Dataset):
     def __init__(self,
@@ -141,15 +139,16 @@ class NFLDataset(Dataset):
         failed_count = 0
         np.random.seed(0)
 
-        drop_columns = [
-            "contact_id", "game_play", "datetime", "team_1", "position_1", "team_2", "position_2",
-            "nfl_player_id_1", "nfl_player_id_2",
-            "game_key", "contact"
-        ]
         label_sum = 0
         use_features = pd.read_csv(
-            "../../output/lgbm/exp004/20230106205611/feature_importance.csv"
-        )["col"].values[:10]
+            "../../output/lgbm/exp010/20230115195553/feature_importance.csv"
+        )["col"].values[:100]
+
+        # use_features = [
+        #     "distance", "speed_1", "distance_1", "diff_distance_groupby_is_same_team", "Endzone_distance_helmet",
+        #     "move_helmet", "move_sensor", "speed_2"
+        # ]
+        df[use_features] = np.log1p(df[use_features]).fillna(0).replace(np.inf, 0).replace(-np.inf, 0)
 
         for key, w_df in tqdm.tqdm(df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])):
             contacts_ = w_df["contact"].values
@@ -157,11 +156,9 @@ class NFLDataset(Dataset):
             contact_ids = [""] * config.max_length
             contact_ids[:len(w_df)] = w_df["contact_id"].values.tolist()
             # w_df = w_df.drop(drop_columns, axis=1).fillna(0).replace(np.inf, 0).replace(-np.inf, 0)
-
-            w_df = w_df[use_features].fillna(0).replace(np.inf, 0).replace(-np.inf, 0)
-
-            feature_ary = np.zeros((config.max_length, config.hidden_size_transformer))
-            feature_ary[:len(w_df), :] = w_df.values
+            # w_df = w_df[use_features].fillna(0).replace(np.inf, 0).replace(-np.inf, 0)
+            feature_ary = np.zeros((config.max_length, len(use_features)))
+            feature_ary[:len(w_df), :] = w_df[use_features].values
 
             mask = np.ones(config.max_length)
             mask[:len(contacts_)] = 0
@@ -282,7 +279,7 @@ def eval_fn(data_loader, model, criterion, device):
 
             mask_flat = mask.flatten().detach().cpu().numpy()
 
-            contact_id = np.array(contact_id).flatten()
+            contact_id = np.array(contact_id).transpose(1, 0).flatten()
             contact_id = contact_id[mask_flat == 0]
 
             mask_flat = mask.flatten()
@@ -338,6 +335,7 @@ class TransformerModel(nn.Module):
                  config: Config):
         super().__init__()
         self.config = config
+        self.fc1 = nn.LazyLinear(self.config.hidden_size_transformer)
         self.bn = nn.BatchNorm1d(self.config.hidden_size_transformer)
         transformer_encoder = nn.TransformerEncoderLayer(
             d_model=self.config.hidden_size_transformer,
@@ -361,7 +359,7 @@ class TransformerModel(nn.Module):
         self.fc = nn.LazyLinear(1)
 
     def forward(self, x, mask):
-        x = self.bn(x.permute(0, 2, 1)).permute(0, 2, 1)
+        x = self.fc1(x)
         x = self.transformer(x)  # (bs, seq_len, n_feature) -> (bs, seq_len, n_feature)
         # x = self.rnn(x)[0]  # (bs, seq_len, n_feature) -> (bs, seq_len, n_feature)
         # x = self.layer_norm(x)
@@ -502,7 +500,7 @@ def main(config):
                 best_func = None
                 logger.info(f"loss: train {train_loss}, val {valid_loss}")
                 logger.info(f"------ MCC ------")
-                for func in [np.mean, np.max, np.min]:
+                for func in [np.mean]:
                     df_score = df_merge.groupby(["contact_id", "contact"], as_index=False)["score"].apply(func)
 
                     auc = roc_auc_score(df_score["contact"].values, df_score["score"].values)
@@ -549,5 +547,10 @@ if __name__ == "__main__":
 
     for lr in [1e-3, 3e-3, 1e-4, 3e-4]:
         exp_name = f"transformer_lr{lr}"
+        config = Config(exp_name=exp_name, lr=lr)
+        main(config)
+
+    for weight_decay in [0.1, 0.01]:
+        exp_name = f"transformer_weight_decay{weight_decay}"
         config = Config(exp_name=exp_name, lr=lr)
         main(config)

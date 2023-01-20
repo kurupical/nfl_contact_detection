@@ -6,3 +6,4 @@ notebook/*
 util/watch_log/
 util/
 tools/watch_log/*.txt
+experiments/cnn_2d/wandb/
