@@ -21,7 +21,7 @@ import pickle
 pd.set_option("max_row", 1000)
 pd.set_option("max_column", 200)
 
-debug = False
+debug = True
 
 def sin(x):
     ans = np.sin(x / 180 * np.pi)
@@ -137,10 +137,11 @@ class LGBMModel:
         self.logger.info(f"[aggregate view]before: {len(df)}")
         helmet_columns = [
             "left_1", "width_1", "top_1", "height_1", "x_1", "y_1",
-            "left_2", "width_2", "top_2", "height_2", "x_2", "y_2"
+            "left_2", "width_2", "top_2", "height_2", "x_2", "y_2",
         ]
         df_endzone = df[df["view"] == "Endzone"].drop("view", axis=1)
         df_sideline = df[df["view"] == "Sideline"].drop("view", axis=1)
+        df_other = df[df["view"].isnull()]
         df_endzone.columns = [f"Endzone_{col}" if col in helmet_columns else col for col in df_endzone.columns]
         df_sideline.columns = [f"Sideline_{col}" if col in helmet_columns else col for col in df_sideline.columns]
         df["contact_id"] = df["game_play"] + "_" + df["step"].astype(str) + "_" + df["nfl_player_id_1"].astype(
@@ -148,6 +149,7 @@ class LGBMModel:
         df = df[["contact_id"]].drop_duplicates()
         df = pd.merge(df, df_endzone, how="left")
         df = pd.merge(df, df_sideline, how="left")
+        df = pd.concat([df, df_other])
         df = df.sort_values(["game_play", "step", "nfl_player_id_1", "nfl_player_id_2"])
         self.logger.info(f"[aggregate view]after: {len(df)}")
 

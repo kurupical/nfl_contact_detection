@@ -9,8 +9,8 @@ RED = (0, 0, 255)
 WHITE = (255, 255, 255)
 BLUE = (255, 0, 0)
 GREEN = (0, 255, 0)
-output_size = (128, 96)
-output_dir = f"../../output/preprocess/images/images_{output_size[0]}x{output_size[1]}_v7"
+output_size = (96, 72)
+output_dir = f"../../output/preprocess/images/images_{output_size[0]}x{output_size[1]}_v8"
 traintest = "train"
 
 bbox_left_ratio = 4
@@ -112,8 +112,6 @@ def main():
         df_["nfl_player_id"] = nfl_player_id
         df_["view"] = view
         df_["team"] = team
-        for col in ["x", "y", "width", "height"]:
-            df_[f"{col}_interpolate"] = df_[col].interpolate(limit=60, limit_area="inside")
         df_helmets_concat.append(df_)
 
     df_helmets = pd.concat(df_helmets_concat)
@@ -123,8 +121,7 @@ def main():
     for i, game_play in enumerate(tqdm.tqdm(game_plays)):
         gp = join_helmets_contact(game_play, df_labels, df_helmets, df_meta)
         for col in ["x", "y", "width", "height"]:
-            gp[col] = gp[[f"{col}_interpolate_1", f"{col}_interpolate_2"]].mean(axis=1)
-        gp["bbox_size"] = gp[["width", "height"]].mean(axis=1)
+            gp[col] = gp[[f"{col}_1", f"{col}_2"]].mean(axis=1)
         for view in ["Endzone", "Sideline"]:
             gp_ = gp[gp["view"] == view]
 
@@ -172,10 +169,16 @@ def main():
                     series = w_df.loc[frame]
                     if np.isnan(series["x"]):
                         continue
-                    left = int(series["x"] - series["bbox_size"] * bbox_left_ratio)
-                    right = int(series["x"] + series["bbox_size"] * bbox_right_ratio)
-                    top = int(series["y"] + series["bbox_size"] * bbox_top_ratio)
-                    down = int(series["y"] - series["bbox_size"] * bbox_down_ratio)
+                    # player が写っていない場合(player1の情報がない or player2の情報がなくGじゃない) frame を取得しない!
+                    if np.isnan(series["left_1"]):
+                        continue
+                    if np.isnan(series["left_2"]) and series["nfl_player_id_2"] != "G":
+                        continue
+
+                    left = int(series["x"] - series["width"] * bbox_left_ratio)
+                    right = int(series["x"] + series["width"] * bbox_right_ratio)
+                    top = int(series["y"] + series["height"] * bbox_top_ratio)
+                    down = int(series["y"] - series["height"] * bbox_down_ratio)
 
                     left = max(0, left)
                     down = max(0, down)

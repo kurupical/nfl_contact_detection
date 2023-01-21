@@ -4,7 +4,7 @@ import os
 import numpy as np
 import tqdm
 import json
-
+from itertools import combinations
 
 def join_helmets_contact(game_play, labels, helmets, meta, view="Sideline", fps=59.94):
     """
@@ -86,13 +86,12 @@ df_tracking["nfl_player_id"] = df_tracking["nfl_player_id"].astype(str)
 game_plays = df_labels["game_play"].drop_duplicates().values
 
 df_helmets_concat = []
-for key, df_ in tqdm.tqdm(df_helmets.groupby(["game_play", "view", "nfl_player_id", "team"])):
+for key, df_ in tqdm.tqdm(df_helmets.groupby(["game_play", "view", "nfl_player_id"])):
     frame_min = df_["frame"].min()
     frame_max = df_["frame"].max()
     game_play = key[0]
     view = key[1]
     nfl_player_id = key[2]
-    team = key[3]
 
     df_ = pd.merge(
         pd.DataFrame({"frame": np.arange(frame_min, frame_max + 1)}).astype(int),
@@ -102,7 +101,6 @@ for key, df_ in tqdm.tqdm(df_helmets.groupby(["game_play", "view", "nfl_player_i
     df_["game_play"] = game_play
     df_["nfl_player_id"] = nfl_player_id
     df_["view"] = view
-    df_["team"] = team
     df_helmets_concat.append(df_)
 
 df_helmets = pd.concat(df_helmets_concat)
@@ -113,18 +111,55 @@ for key, w_df_helms in tqdm.tqdm(df_helmets.groupby(["game_play", "view"])):
     try:
         game_play = key[0]
         view = key[1]
-        gp = join_helmets_contact(game_play, df_labels, w_df_helms, df_meta, view=view)
+        gp = join_helmets_contact(game_play, df_labels, w_df_helms, df_meta, view=view).drop(["team_1", "team_2"], axis=1)
         gps.append(gp)
+
+        nfl_player_ids = df_labels[df_labels["game_play"] == game_play]["nfl_player_id_1"].drop_duplicates().values
+        step_min, step_max = gp["step"].min(), gp["step"].max()
+
+        for players in combinations(nfl_player_ids, 2):
+            if players[0] == "G":
+                player_id_1 = players[1]
+                player_id_2 = players[0]
+            elif players[1] == "G":
+                player_id_1 = players[0]
+                player_id_2 = players[1]
+            else:
+                player_id_1 = min([int(players[0]), int(players[1])])
+                player_id_2 = max([int(players[0]), int(players[1])])
+
+            # previous
+            gp_ = pd.DataFrame({
+                "game_play": game_play,
+                "step": np.arange(step_min-20, step_min),
+            })
+            gp_["nfl_player_id_1"] = player_id_1
+            gp_["nfl_player_id_2"] = player_id_2
+            gp_["view"] = view
+            gps.append(gp_)
+
+            # next
+            gp_ = pd.DataFrame({
+                "game_play": game_play,
+                "step": np.arange(step_max, step_max+20),
+            })
+            gp_["nfl_player_id_1"] = player_id_1
+            gp_["nfl_player_id_2"] = player_id_2
+            gp_["view"] = view
+            gps.append(gp_)
+
     except Exception as e:
         print(e)
 
-gps = pd.concat(gps)
+gps = pd.concat(gps).sort_values(["game_play", "nfl_player_id_1", "nfl_player_id_2", "step"])
+gps["nfl_player_id_1"] = gps["nfl_player_id_1"].astype(str)
+gps["nfl_player_id_2"] = gps["nfl_player_id_2"].astype(str)
 
 tracking_columns = [
-    "game_play", "game_key", "nfl_player_id", "datetime", "step", "position", "x_position", "y_position",
-    "speed", "distance", "direction", "orientation", "acceleration", "sa"
+    "game_play", "game_key", "nfl_player_id", "step", "position", "x_position", "y_position",
+    "speed", "distance", "direction", "orientation", "acceleration", "sa", "team"
 ]
-key_columns = ["game_play", "datetime", "game_key", "step"]
+key_columns = ["game_play", "game_key", "step"]
 gps = pd.merge(
     gps,
     df_tracking[tracking_columns].rename(columns={col: f"{col}_1" if col not in key_columns else col for col in tracking_columns}),
@@ -133,7 +168,7 @@ gps = pd.merge(
 gps = pd.merge(
     gps,
     df_tracking[tracking_columns].rename(columns={col: f"{col}_2" if col not in key_columns else col for col in tracking_columns}),
-    how="outer"
+    how="left"
 )
 
 gps["distance"] = np.sqrt(
@@ -142,6 +177,8 @@ gps["distance"] = np.sqrt(
 
 print(gps.isnull().sum() / len(gps))
 gps["frame"] = gps["frame"].fillna(99999).astype(int)
+gps["nfl_player_id_1"] = gps["nfl_player_id_1"].astype(str)
+gps["nfl_player_id_2"] = gps["nfl_player_id_2"].astype(str)
 output_dir = "../../output/preprocess/master_data_v4/"
 os.makedirs(output_dir, exist_ok=True)
 gps.reset_index(drop=True).to_feather(f"{output_dir}/gps.feather")
