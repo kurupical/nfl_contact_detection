@@ -5,12 +5,12 @@ import numpy as np
 import tqdm
 
 
-RED = (0, 0, 255)
-WHITE = (255, 255, 255)
-BLUE = (255, 0, 0)
-GREEN = (0, 255, 0)
-output_size = (128, 96)
-output_dir = f"../../output/preprocess/images/images_{output_size[0]}x{output_size[1]}_v7"
+CONTACT = (0, 0, 0)
+AWAY = (0, 78, 255)
+HOME = (255, 255, 255)
+PLAYER = (255, 0, 0)
+output_size = (192, 144)
+output_dir = f"../../../work/images_{output_size[0]}x{output_size[1]}_v10"
 traintest = "train"
 
 bbox_left_ratio = 4.5
@@ -112,9 +112,8 @@ def main():
         df_["nfl_player_id"] = nfl_player_id
         df_["view"] = view
         df_["team"] = team
-        for col in ["x", "y", "width", "height"]:
-            df_[f"{col}_interpolate"] = df_[col].interpolate(limit=5, limit_area="inside")
-            df_[f"{col}_interpolate"] = df_[col].rolling(window=7, min_periods=1).mean()
+        # for col in ["x", "y", "left", "top", "width", "height"]:
+        #     df_[col] = df_[col].interpolate(limit=5, limit_area="inside")
         df_helmets_concat.append(df_)
 
     df_helmets = pd.concat(df_helmets_concat)
@@ -124,8 +123,7 @@ def main():
     for i, game_play in enumerate(tqdm.tqdm(game_plays)):
         gp = join_helmets_contact(game_play, df_labels, df_helmets, df_meta)
         for col in ["x", "y", "width", "height"]:
-            gp[col] = gp[[f"{col}_interpolate_1", f"{col}_interpolate_2"]].mean(axis=1)
-        gp["bbox_size"] = gp[["width", "height"]].mean(axis=1)
+            gp[col] = gp[[f"{col}_1", f"{col}_2"]].mean(axis=1)
         for view in ["Endzone", "Sideline"]:
             gp_ = gp[gp["view"] == view]
 
@@ -149,7 +147,6 @@ def main():
                 if frame not in frames:
                     continue
 
-                # 全プレイヤーのヘルメットをmask
                 img_filter = img_.copy()
                 for bbox in bbox_dict[frame]:
                     box_left = bbox[0]
@@ -160,11 +157,10 @@ def main():
                         img_filter,
                         (box_left, box_top),
                         (box_right, box_down),
-                        WHITE,
+                        PLAYER,
                         thickness=-1,
                     )
-                img_ = cv2.addWeighted(src1=img_, alpha=0.7, src2=img_filter, beta=0.3, gamma=0)
-
+                img_ = cv2.addWeighted(src1=img_, alpha=0.75, src2=img_filter, beta=0.25, gamma=0)
                 for key, w_df in data_dict.items():
                     img = img_.copy()
 
@@ -173,10 +169,10 @@ def main():
                     series = w_df.loc[frame]
                     if np.isnan(series["x"]):
                         continue
-                    left = int(series["x"] - series["bbox_size"] * bbox_left_ratio)
-                    right = int(series["x"] + series["bbox_size"] * bbox_right_ratio)
-                    top = int(series["y"] + series["bbox_size"] * bbox_top_ratio)
-                    down = int(series["y"] - series["bbox_size"] * bbox_down_ratio)
+                    left = int(series["x"] - series["width"] * bbox_left_ratio)
+                    right = int(series["x"] + series["width"] * bbox_right_ratio)
+                    top = int(series["y"] + series["height"] * bbox_top_ratio)
+                    down = int(series["y"] - series["height"] * bbox_down_ratio)
 
                     left = max(0, left)
                     down = max(0, down)
@@ -190,16 +186,16 @@ def main():
                             continue
 
                         if series[f"nfl_player_id_2"] == "G":
-                            box_color = GREEN
+                            box_color = CONTACT
                         elif player_id == 1:
-                            box_color = RED
-                        elif player_id == 2 and series["team_1"] != series["team_2"]:
-                            box_color = BLUE
-                        elif player_id == 2 and series["team_1"] == series["team_2"]:
-                            box_color = RED
+                            box_color = HOME
+                        elif player_id == 2:
+                            if series["team_1"] != series["team_2"]:
+                                box_color = AWAY
+                            else:
+                                box_color = HOME
                         else:
                             raise ValueError
-
                         box_left = max(0, int(series[f"left_{player_id}"]) - left)
                         box_right = max(min(img.shape[1], int(series[f"left_{player_id}"] + series[f"width_{player_id}"]) - left), 0)
                         box_top = max(0, int(series[f"top_{player_id}"]) - down)
@@ -216,7 +212,7 @@ def main():
                         #     int(series[f"left_{player_id}"]):int(series[f"left_{player_id}"] + series[f"width_{player_id}"])+1,
                         # ] += np.array(box_color, dtype=np.uint8)
 
-                    img = cv2.addWeighted(src1=img, alpha=0.7, src2=img_filter, beta=0.3, gamma=0)
+                    img = cv2.addWeighted(src1=img, alpha=0.5, src2=img_filter, beta=0.5, gamma=0)
                     # img = (img*0.7 + img_filter*0.3).astype(np.uint8)
 
                     img = cv2.resize(img, dsize=output_size)

@@ -32,7 +32,11 @@ import albumentations as A
 import random
 import glob
 import gc
+import dgl
+from dgl.dataloading import GraphDataLoader
+from dgl.nn import EGATConv
 
+debug = False
 torch.backends.cudnn.benchmark = True
 
 def get_logger(output_dir=None, logging_level=logging.INFO):
@@ -50,11 +54,89 @@ def get_logger(output_dir=None, logging_level=logging.INFO):
         logger.addHandler(file_handler)
     return logger
 
+@dataclasses.dataclass
+class ConfigForGNN:
+    exp_name: str
+    debug: bool = debug
+    epochs: int = 1
+    if debug:
+        epochs: int = 1
+    lr: float = 1e-3
+    lr_fc: float = 1e-3
+    weight_decay: float = 0.001
+    model_name: str = "egat"
+    scheduler: str = "StepLRWithWarmUp"
+    step_size_ratio: float = 2
+    gamma: float = 0.1
+    warmup_ratio: float = 0.01
+    criterion: str = "bcewithlogitsloss"
+    gradient_clipping: float = 10
+
+    base_dir: str = "../../output/preprocess/images"
+    data_dir: str = f"../../output/preprocess/master_data_v3"
+
+    n_predict_frames: int = 1
+    node_feats: int = 64
+    edge_feats: int = 64
+    batch_size: int = 32
+
+    data_per_epoch: float = 1
+    calc_single_view_loss: bool = False
+
+
+@dataclasses.dataclass
+class ConfigForTransformer:
+    exp_name: str
+    debug: bool = debug
+
+    epochs: int = 5
+    if debug:
+        epochs: int = 1
+
+    lr: float = 1e-3
+    lr_fc: float = 1e-3
+    weight_decay: float = 0.01
+    n_frames: int = 31
+    n_predict_frames: int = 1
+
+    if n_frames % 2 == 0 or n_predict_frames % 2 == 0:
+        raise ValueError
+    data_dir: str = f"../../output/preprocess/master_data_v3"
+    base_dir: str = "../../output/preprocess/images"
+    image_path: str = "images_128x96_v10"
+    model_name: str = "transformer"
+    gradient_clipping: float = 10
+    data_per_epoch: float = 1
+    batch_size: int = 128
+    use_data_step: int = 1
+    criterion: str = "bcewithlogitsloss"
+    scheduler: str = "linear"
+    step_size_ratio: float = 2
+    gamma: float = 0.1
+    warmup_ratio: float = 0.1
+    calc_single_view_loss: bool = False  # 固定
+
+    # transformer
+    hidden_size_transformer: int = 128  # TODO: exp002に合わせて
+    num_layer_transformer: int = 2
+    nhead: int = 8
+    num_layer_rnn: int = 1
+    feature_dir: str = "../../output/preprocess/feature/exp017/feature_len13876756.feather"
+    max_length: int = 256
+    apply_log1p: bool = True
+    apply_ffn: bool = True
+
+    use_features: List[str] = pd.read_csv(
+        "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
+    )["col"].values[:100]
+
+    submission_mode: bool = False
+
 
 @dataclasses.dataclass
 class Config:
     exp_name: str
-    debug: bool = False
+    debug: bool = debug
     epochs: int = 1
     if debug:
         epochs: int = 1
@@ -67,13 +149,13 @@ class Config:
 
     if n_frames % 2 == 0 or n_predict_frames % 2 == 0:
         raise ValueError
-    step: int = 4
+    step: int = 3
     extention: str = ".jpg"
     negative_sample_ratio_close: float = 1
     negative_sample_ratio_far: float = 1
     negative_sample_ratio_g: float = 0.2
     base_dir: str = "../../output/preprocess/images"
-    image_path: str = "images_128x96_v6"
+    image_path: str = "images_128x96_v10"
     data_dir: str = f"../../output/preprocess/master_data_v3"
     img_shape: Tuple[int, int] = (96, 128)
     gradient_clipping: float = 0.2
@@ -88,9 +170,9 @@ class Config:
     dropout_seq: float = 0.2
     activation: nn.Module = nn.ReLU
 
-    kernel_size_conv1d: int = 3
+    kernel_size_conv1d: int = 13
     stride_conv1d: int = 1
-    hidden_size_1d: int = 32
+    hidden_size_1d: int = 300
 
     submission_mode: bool = False
 
@@ -103,7 +185,6 @@ class Config:
     criterion: str = "bcewithlogitsloss"
     fc: str = "simple"
     fc_dropout: float = 0.2
-    lr_reduce_ratio: float = 1
 
     scheduler: str = "StepLRWithWarmUp"
     step_size_ratio: float = 0.3
@@ -120,7 +201,6 @@ class Config:
 
     transforms_train: A.Compose = A.Compose([
         A.HorizontalFlip(p=0.5),
-        A.RandomGamma(p=0.25),
     ])
     transforms_eval: A.Compose = A.Compose([
     ])
@@ -141,6 +221,12 @@ class Config:
     num_layer_transformer: int = 2
 
     save_feature: bool = True
+    interpolate_outside: bool = True
+    image_feature_dir: str = ""
+
+    pretrained_feature_dim: int = 512
+    sep_is_g: bool = True
+    channel_3d: int = 3
 
 
 class NFLDatasetForFeatureExtraction(Dataset):
@@ -160,6 +246,152 @@ class NFLDatasetForFeatureExtraction(Dataset):
         return torch.Tensor(img), [file]
 
 
+class NFLTransformerDataset(Dataset):
+    def __init__(self,
+                 df: pd.DataFrame,
+                 base_dir: str,
+                 logger: Logger,
+                 config: ConfigForTransformer,
+                 test: bool):
+        self.base_dir = base_dir
+        self.config = config
+        self.test = test
+        self.exist_files = set()
+        self._get_item_information(df, logger)
+
+    def _get_base_dir(self,
+                      game_play: str,
+                      view: str,
+                      id_1: str,
+                      id_2: str):
+        return f"{self.base_dir}/{game_play}/{view}/{id_1}_{id_2}"
+
+    def _get_key(self,
+                 game_play,
+                 view,
+                 id_1,
+                 id_2,
+                 frame):
+        if self.image_dict is not None:
+            # for submission
+            return f"{game_play}_{view}_{id_1}_{id_2}_{frame}"
+        else:
+            # for local training
+            base_dir = self._get_base_dir(game_play, view, id_1, id_2)
+            return f"{base_dir}_{frame}{self.config.extention}"
+
+    def _get_item_information(self, df: pd.DataFrame, logger: Logger):
+        self.items = []
+        logger.info("_get_item_information start")
+
+        failed_count = 0
+        np.random.seed(0)
+
+        label_sum = 0
+
+        df = df[df["contact"].notnull()]
+        if self.config.apply_log1p:
+            df[self.config.use_features] = np.log1p(df[self.config.use_features]).fillna(0).replace(np.inf, 0).replace(-np.inf, 0)
+        else:
+            df[self.config.use_features] = df[self.config.use_features].fillna(0).replace(np.inf, 0).replace(-np.inf, 0)
+
+        for key, w_df in tqdm.tqdm(df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])):
+            id_2 = key[2]
+
+            is_g = int(id_2 == "G")
+            contacts_ = w_df["contact"].values
+
+            contact_ids = [""] * config.max_length
+            contact_ids[:len(w_df)] = w_df["contact_id"].values.tolist()
+            # w_df = w_df.drop(drop_columns, axis=1).fillna(0).replace(np.inf, 0).replace(-np.inf, 0)
+            # w_df = w_df[use_features].fillna(0).replace(np.inf, 0).replace(-np.inf, 0)
+            feature_ary = np.zeros((config.max_length, len(self.config.use_features)))
+            feature_ary[:len(w_df), :] = w_df[self.config.use_features].values
+
+            mask = np.ones(config.max_length)
+            mask[:len(contacts_)] = 0
+
+            contacts = np.zeros(config.max_length)
+            contacts[:len(contacts_)] = contacts_
+            label_sum += contacts.sum()
+
+            self.items.append({
+                "contact_id": contact_ids,
+                "contact": contacts,
+                "feature": feature_ary,
+                "is_g": is_g,
+                "mask": mask
+            })
+            if self.config.debug and len(self.items) > 300:
+                break
+
+        logger.info(f"finished. extracted={len(self.items)} (total_df={len(df)}, label_sum={label_sum})")
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        item = self.items[index]
+
+        contact_id = item["contact_id"]
+        feature = item["feature"]
+        mask = item["mask"]
+        labels = item["contact"]
+        is_g = item["is_g"]
+
+        return contact_id, torch.Tensor(feature), torch.Tensor(labels), torch.Tensor(mask), torch.LongTensor([is_g])
+
+
+class NFLGraphDataset(dgl.data.DGLDataset):
+    def __init__(self, df: pd.DataFrame, config: Config):
+        self.df = df
+        self.config = config
+        self.max_len = 22*22
+        super().__init__(name="nfl")
+
+    def _load_graph(self, df):
+        graphs = []
+        contact_ids = []
+        df["is_same_team"] = (df["team_1"] == df["team_2"]).astype(int)
+        for k, w_df in tqdm.tqdm(
+            df.drop_duplicates(["game_play", "step", "nfl_player_id_1", "nfl_player_id_2"]).groupby(["game_play", "step"])
+        ):
+            w_df = w_df.sort_values(["nfl_player_id_1", "nfl_player_id_2"])
+            w_df["nfl_player_id_2"] = [ary[0] if ary[1] == "G" else ary[1] for ary in
+                                       w_df[["nfl_player_id_1", "nfl_player_id_2"]].values]
+            id_dict = {p_id: i for i, p_id in
+                       enumerate(np.unique(w_df[["nfl_player_id_1", "nfl_player_id_2"]].values.flatten()))}
+            g = dgl.graph([
+                (id_dict[x[0]], id_dict[x[1]]) for x in w_df[["nfl_player_id_1", "nfl_player_id_2"]].values
+            ])
+            g.ndata["feature"] = torch.Tensor(w_df.drop_duplicates(["game_play", "step", "nfl_player_id_1"])[
+                                                  ["speed_1", "distance_1", "acceleration_1"]].values)
+            g.edata["distance"] = torch.Tensor(w_df["distance"].fillna(0).values.reshape(-1, 1))
+            g.edata["is_same_team"] = torch.LongTensor(w_df["is_same_team"].fillna(0).values.reshape(-1, 1))
+            g.edata["label"] = torch.Tensor(w_df["contact"].values)
+            graphs.append(g)
+            contact_ids.append(w_df["contact_id"].values)
+            if len(graphs) > 100 and config.debug:
+                break
+        return graphs, contact_ids
+
+    def process(self):
+        self.graphs, self.contact_ids = self._load_graph(self.df)
+        del self.df
+
+    def __getitem__(self, idx):
+        dummy = torch.Tensor([0])
+        pad = [""]
+        contact_ids = self.contact_ids[idx].tolist()
+        if len(contact_ids) < self.max_len:
+            contact_ids += pad * (self.max_len - len(contact_ids))
+
+        return contact_ids, self.graphs[idx], dummy, dummy, dummy
+
+    def __len__(self):
+        return len(self.graphs)
+
+
 class NFLDataset(Dataset):
     def __init__(self,
                  df: pd.DataFrame,
@@ -167,6 +399,7 @@ class NFLDataset(Dataset):
                  logger: Logger,
                  config: Config,
                  test: bool,
+                 use_filelist: bool = True,
                  submission_mode: bool = True,
                  image_dict: dict = None):
         self.base_dir = base_dir
@@ -177,21 +410,35 @@ class NFLDataset(Dataset):
         self.submission_mode = submission_mode
 
         filelist_path = f"{self.base_dir}/filelist.pickle"
-        if os.path.isfile(filelist_path):
-            logger.info("load filelist...")
-            with open(filelist_path, "rb") as f:
-                filelist = pickle.load(f)
+        if use_filelist:
+            if os.path.isfile(filelist_path):
+                logger.info("load filelist...")
+                with open(filelist_path, "rb") as f:
+                    filelist = pickle.load(f)
+            else:
+                logger.info("make filelist...")
+                filelist = glob.glob(f"{self.base_dir}/*/*/*.jpg")
+                filelist = [f.replace("\\", "/") for f in filelist]
+                filelist = set(filelist)
+                logger.info("save filelist...")
+                with open(filelist_path, "wb") as f:
+                    pickle.dump(filelist, f)
         else:
-            logger.info("make filelist...")
-            filelist = glob.glob(f"{self.base_dir}/*/*/*.jpg")
-            filelist = [f.replace("\\", "/") for f in filelist]
-            filelist = set(filelist)
-            logger.info("save filelist...")
-            with open(filelist_path, "wb") as f:
-                pickle.dump(filelist, f)
+            filelist = None
 
         if not self.submission_mode:
             self.filelist = filelist
+        if self.config.model_name == "cnn_2d1d":
+            logger.info("load features...")
+            self.image_dict = {key: value for key, value in zip(
+                np.load(f"{self.config.image_feature_dir}/files.npy"),
+                np.load(f"{self.config.image_feature_dir}/preds.npy")
+            )}
+            self.img_shape = list(self.image_dict.values())[0].shape
+        elif "2.5d" not in self.config.model_name:
+            self.img_shape = (self.config.img_shape[0], self.config.img_shape[1], 3)
+        else:
+            self.img_shape = (self.config.img_shape[0], self.config.img_shape[1], 1)
         self._get_item_information(df, logger, filelist)
 
     def _get_base_dir(self,
@@ -207,9 +454,11 @@ class NFLDataset(Dataset):
                  id_1,
                  id_2,
                  frame):
-        # for local training
-        base_dir = self._get_base_dir(game_play, view, id_1, id_2)
-        return f"{base_dir}_{frame}{self.config.extention}"
+        if self.image_dict is not None:
+            return f"{game_play}_{view}_{id_1}_{id_2}_{frame}"
+        else:
+            base_dir = self._get_base_dir(game_play, view, id_1, id_2)
+            return f"{base_dir}_{frame}{self.config.extention}"
 
     def _exist_file(self,
                     game_play,
@@ -218,7 +467,12 @@ class NFLDataset(Dataset):
                     id_2,
                     frame,
                     filelist):
-        return self._get_key(game_play, view, id_1, id_2, frame) in filelist
+        if self.image_dict is not None:
+            # for pretrained features
+            return self._get_key(game_play, view, id_1, id_2, frame) in self.image_dict
+        else:
+            # for local training
+            return self._get_key(game_play, view, id_1, id_2, frame) in filelist
 
     def _exist_files(self,
                      game_play: str,
@@ -314,7 +568,7 @@ class NFLDataset(Dataset):
                     feature = [0]
 
                 assert len(predict_frames_indice) == self.config.n_predict_frames
-                if distances[i] > self.config.distance_threshold:
+                if distances[predict_frames_indice].min() > self.config.distance_threshold:
                     continue
 
                 if not self.test and contacts[predict_frames_indice].sum() == 0:
@@ -368,9 +622,13 @@ class NFLDataset(Dataset):
             return None
         if not self.submission_mode:
             isfile = key in self.filelist
+        elif self.image_dict is not None:
+            isfile = key in self.image_dict
         else:
             isfile = os.path.isfile(key)
         if isfile:
+            if self.image_dict is not None:
+                return self.image_dict[key]
             if self.config.extention == ".npy":
                 img = np.load(key)
             if self.config.extention == ".jpg":
@@ -412,31 +670,43 @@ class NFLDataset(Dataset):
 
             if self.config.interpolate_image:
                 # 外挿
-                first_img_idx = [i for i, img in enumerate(imgs) if img is not None]
+                img_indices = [i for i, img in enumerate(imgs) if img is not None]
 
-                if len(first_img_idx) == 0:
-                    if "2.5d" not in self.config.model_name:
-                        imgs_all.extend(
-                            [np.zeros((self.config.img_shape[0], self.config.img_shape[1], 3), dtype=np.uint8) for _ in
-                             range(len(imgs))])
-                    else:
-                        imgs_all.extend(
-                            [np.zeros((self.config.img_shape[0], self.config.img_shape[1], 1), dtype=np.uint8) for _ in
-                             range(len(imgs))])
+                if len(img_indices) == 0:
+                    imgs_all.extend(
+                        [np.zeros(self.img_shape, dtype=np.uint8) for _ in
+                         range(len(imgs))])
                     continue
-                first_img_idx = first_img_idx[0]
+                first_img_idx = img_indices[0]
 
+                # 最初の画像まで
                 for idx in range(first_img_idx):
-                    imgs[idx] = imgs[first_img_idx].copy()
-                for i in range(len(imgs) - 1):
-                    if imgs[i + 1] is None:
-                        imgs[i + 1] = imgs[i].copy()
+                    if self.config.interpolate_outside:
+                        imgs[idx] = imgs[first_img_idx].copy()
+                    else:
+                        imgs[idx] = np.zeros(self.img_shape, dtype=np.uint8)
+
+                # 最初の画像から最後まで
+                if self.config.interpolate_outside:
+                    for i in range(len(imgs) - 1):
+                        if imgs[i + 1] is None:
+                            imgs[i + 1] = imgs[i].copy()
+                else:
+                    for i in range(img_indices[-1]):
+                        if imgs[i + 1] is None:
+                            imgs[i + 1] = imgs[i].copy()
+                    for i in range(img_indices[-1] + 1, len(imgs)):
+                        imgs[i] = np.zeros(self.img_shape, dtype=np.uint8)
             else:
-                imgs = [img if img is not None else np.zeros((self.config.img_shape[0], self.config.img_shape[1], 3), dtype=np.uint8) for img in imgs]
+                imgs = [img if img is not None else np.zeros(self.img_shape, dtype=np.uint8) for img in imgs]
             imgs_all.extend(imgs)
-        frames = np.stack(imgs_all, axis=0).transpose(3, 0, 1, 2)  # shape = (C, n_frame*n_view, H, W)
-        frames = self.aug_video(frames.transpose(1, 2, 3, 0)) # shape = (n_frame, H, W, C)
-        frames = frames.transpose(3, 0, 1, 2)
+
+        if len(self.img_shape) == 3:
+            frames = np.stack(imgs_all, axis=0).transpose(3, 0, 1, 2)  # shape = (C, n_frame*n_view, H, W)
+            frames = self.aug_video(frames.transpose(1, 2, 3, 0)) # shape = (n_frame, H, W, C)
+            frames = frames.transpose(3, 0, 1, 2)
+        elif len(self.img_shape) == 1:
+            frames = np.stack(imgs_all, axis=0)  # shape = (n_frame*n_view, feature)
 
         return contact_id.tolist(), torch.Tensor(frames), torch.Tensor(labels), torch.LongTensor([is_g]), torch.Tensor(feature)
 
@@ -471,9 +741,6 @@ def train_fn(dataloader, model, criterion, optimizer, device, scheduler, epoch, 
     scaler = torch.cuda.amp.GradScaler()
     count = 0
     loss_100 = []
-    loss_concat_100 = []
-    loss_endzone_100 = []
-    loss_sideline_100 = []
     for bi, data in tk0:
         count += 1
         batch_size = len(data)
@@ -484,15 +751,29 @@ def train_fn(dataloader, model, criterion, optimizer, device, scheduler, epoch, 
         feature = data[4].to(device)
         optimizer.zero_grad()
 
-        with torch.cuda.amp.autocast():
+        enabled = True
+        gnn = type(config) == ConfigForGNN
+        if gnn:
+            enabled = False
+            label = x.edata["label"]
+        with torch.cuda.amp.autocast(enabled=enabled):
             pred, pred_endzone, pred_sideline = model(x, is_g, feature)
-            loss_concat = criterion(pred.flatten(), label.flatten())
-            if config.calc_single_view_loss:
-                loss_endzone = criterion(pred_endzone.flatten(), label.flatten())
-                loss_sideline = criterion(pred_sideline.flatten(), label.flatten())
-                loss = loss_concat + (loss_endzone + loss_sideline) * config.calc_single_view_loss_weight
+            if type(config) == ConfigForTransformer:
+                mask = is_g
+                mask_flat = mask.flatten()
+                label = label.flatten()
+                label = label[mask_flat == 0]
+                pred = pred.flatten()
+                pred = pred[mask_flat == 0]
+                loss = criterion(pred, label)
             else:
-                loss = loss_concat
+                loss_concat = criterion(pred.flatten(), label.flatten())
+                if type(config) == Config and config.calc_single_view_loss:
+                    loss_endzone = criterion(pred_endzone.flatten(), label.flatten())
+                    loss_sideline = criterion(pred_sideline.flatten(), label.flatten())
+                    loss = loss_concat + (loss_endzone + loss_sideline) * config.calc_single_view_loss_weight
+                else:
+                    loss = loss_concat
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clipping)
@@ -543,6 +824,8 @@ def eval_fn(data_loader, model, criterion, device, config: Config):
     labels = []
     features = []
 
+    gnn = type(config) == ConfigForGNN
+    transformer = type(config) == ConfigForTransformer
     with torch.no_grad():
         for bi, data in tk0:
             batch_size = len(data)
@@ -553,14 +836,32 @@ def eval_fn(data_loader, model, criterion, device, config: Config):
             is_g = data[3].to(device)
             feature = data[4].to(device)
 
-            with torch.cuda.amp.autocast():
+            enabled = True
+            if gnn:
+                enabled = False
+                label = x.edata["label"]
+            with torch.cuda.amp.autocast(enabled=enabled):
                 pred, pred_endzone, pred_sideline = model(x, is_g, feature)
-                loss = criterion(pred.flatten(), label.flatten())
+                if type(config) == Config:
+                    loss = criterion(pred.flatten(), label.flatten())
+                elif type(config) == ConfigForTransformer:
+                    mask = is_g
+                    mask_flat = mask.flatten()
+                    label = label.flatten()
+                    label = label[mask_flat == 0]
+                    pred = pred.flatten()
+                    pred = pred[mask_flat == 0]
+                    loss = criterion(pred, label)
 
             loss_score.update(loss.detach().item(), batch_size)
             tk0.set_postfix(Eval_Loss=loss_score.avg)
 
-            contact_ids.extend(np.array(contact_id).transpose(1, 0).flatten())
+            if gnn or transformer:
+                contact_id = np.array(contact_id).transpose(1, 0).flatten()
+                contact_id = contact_id[contact_id != ""]
+                contact_ids.extend(np.array(contact_id))
+            else:
+                contact_ids.extend(np.array(contact_id).transpose(1, 0).flatten())
             preds.extend(torch.sigmoid(pred.flatten()).detach().cpu().numpy())
             if config.calc_single_view_loss:
                 preds_endzone.extend(torch.sigmoid(pred_endzone.flatten()).detach().cpu().numpy())
@@ -579,7 +880,13 @@ def eval_fn(data_loader, model, criterion, device, config: Config):
     idx = np.arange(config.n_predict_frames) - config.n_predict_frames // 2
     indices = np.tile(idx, len(preds) // config.n_predict_frames)
 
-    if config.calc_single_view_loss:
+    if type(config) == ConfigForTransformer:
+        df_ret = pd.DataFrame({
+            "contact_id": contact_ids,
+            "score": preds.tolist(),
+            "label": labels.tolist(),
+        })
+    elif config.calc_single_view_loss:
         df_ret = pd.DataFrame({
             "contact_id": contact_ids,
             "score": preds.tolist(),
@@ -599,6 +906,14 @@ def eval_fn(data_loader, model, criterion, device, config: Config):
     return df_ret, loss_score.avg
 
 
+def get_key(fname):
+    game_play = os.path.dirname(fname).split("/")[-2]
+    id_1 = os.path.basename(fname).split("_")[0]
+    id_2 = os.path.basename(fname).split("_")[1]
+    frame = os.path.basename(fname).split("_")[2].split(".")[0]
+    view = os.path.dirname(fname).split("/")[-1]
+    return f"{game_play}_{view}_{id_1}_{id_2}_{frame}"
+
 def save_feature(model, device: str, config: Config):
     model.eval()
     preds = []
@@ -610,9 +925,9 @@ def save_feature(model, device: str, config: Config):
     )
     if config.debug:
         dataset.files = dataset.files[:1000]
-        num_workers = 1
+        num_workers = 0
     else:
-        num_workers = 16
+        num_workers = 8
     loader = DataLoader(
         dataset,
         batch_size=config.batch_size,
@@ -636,11 +951,114 @@ def save_feature(model, device: str, config: Config):
                 # preds_2d.append(pred_2d.detach().cpu().numpy().astype(np.float16))
                 preds.append(pred.detach().cpu().numpy().astype(np.float16))
 
-            files.extend(np.array(file))
+            files.extend([get_key(f) for f in np.array(file).flatten()])
 
     np.save(f"{config.output_dir}/preds.npy", np.concatenate(preds).astype(np.float16))
     # np.save(f"{config.output_dir}/preds_2d.npy", np.concatenate(preds_2d).astype(np.float16))
     np.save(f"{config.output_dir}/files.npy", np.array(files))
+
+class FFN(nn.Module):
+    def __init__(self, state_size=200):
+        super(FFN, self).__init__()
+        self.state_size = state_size
+
+        self.lr1 = nn.Linear(state_size, state_size)
+        self.ln1 = nn.LayerNorm(state_size)
+        self.relu = nn.ReLU()
+        self.lr2 = nn.Linear(state_size, state_size)
+        self.ln2 = nn.LayerNorm(state_size)
+
+    def forward(self, x):
+        x = self.lr1(x)
+        x = self.ln1(x)
+        x = self.relu(x)
+        x = self.lr2(x)
+        x = self.ln2(x)
+        return x
+
+
+class TransformerModel(nn.Module):
+    def __init__(self,
+                 config: ConfigForTransformer):
+        super().__init__()
+        self.config = config
+        self.fc1 = nn.LazyLinear(self.config.hidden_size_transformer)
+        self.ln1 = nn.LayerNorm(self.config.hidden_size_transformer)
+        self.bn = nn.BatchNorm1d(self.config.hidden_size_transformer)
+        transformer_encoder = nn.TransformerEncoderLayer(
+            d_model=self.config.hidden_size_transformer,
+            nhead=self.config.nhead,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(
+            num_layers=self.config.num_layer_transformer,
+            encoder_layer=transformer_encoder,
+            # norm=nn.LayerNorm(self.config.num_layer_transformer),
+        )
+
+        self.rnn = nn.LSTM(
+            input_size=self.config.hidden_size_transformer,
+            hidden_size=self.config.hidden_size_transformer,
+            num_layers=self.config.num_layer_rnn,
+            batch_first=True,
+        )
+        self.layer_norm = nn.LayerNorm(self.config.hidden_size_transformer)
+        self.ffn_g = FFN(self.config.hidden_size_transformer)
+        self.fc_g = nn.LazyLinear(1)
+        self.ffn_contact = FFN(self.config.hidden_size_transformer)
+        self.fc_contact = nn.LazyLinear(1)
+
+    def forward(self, x, mask, is_g):
+        x = self.fc1(x)
+        x = self.ln1(x)
+        x = self.transformer(x)  # (bs, seq_len, n_feature) -> (bs, seq_len, n_feature)
+        x = self.rnn(x)[0]  # (bs, seq_len, n_feature) -> (bs, seq_len, n_feature)
+        x = self.layer_norm(x)
+
+        x_g = self.ffn_g(x)  # (bs, seq_len, n_feature) -> (bs, seq_len, n_feature)
+        x_g = self.fc_g(x_g)  # (bs, seq_len, n_feature) -> (bs, seq_len, 1)
+        x_g = x_g.squeeze(2)  # (bs, seq_len, 1) -> (bs, seq_len)
+
+        x_contact = self.ffn_contact(x)  # (bs, seq_len, n_feature) -> (bs, seq_len, n_feature)
+        x_contact = self.fc_contact(x_contact)  # (bs, seq_len, n_feature) -> (bs, seq_len, 1)
+        x_contact = x_contact.squeeze(2)  # (bs, seq_len, 1) -> (bs, seq_len)
+
+        not_is_g = (is_g == 0)
+        x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
+
+        return x, None, None
+
+
+class NFLGraphModel(nn.Module):
+    def __init__(self, config: ConfigForGNN):
+        super().__init__()
+
+        self.egat1 = EGATConv(in_node_feats=3,
+                              in_edge_feats=64,
+                              out_node_feats=config.node_feats,
+                              out_edge_feats=config.edge_feats,
+                              num_heads=4)
+        self.egat2 = EGATConv(in_node_feats=config.node_feats,
+                              in_edge_feats=config.edge_feats,
+                              out_node_feats=1,
+                              out_edge_feats=1,
+                              num_heads=4)
+        self.fc_distance = nn.Linear(1, 32)
+        self.emb_sameteam = nn.Embedding(2, 32)
+
+    def forward(self, graph, *args, **kwargs):
+        edge_feats = torch.cat([
+            self.fc_distance(graph.edata["distance"]),
+            self.emb_sameteam(graph.edata["is_same_team"].squeeze(1))
+        ], axis=1)
+        node_feats, edge_feats = self.egat1(graph, graph.ndata["feature"], edge_feats)
+
+        node_feats = node_feats.mean(dim=1)
+        edge_feats = edge_feats.mean(dim=1)
+
+        node_feats, edge_feats = self.egat2(graph, node_feats, edge_feats)
+
+        return edge_feats.mean(dim=1), None, None
 
 
 class SimpleConv3d(nn.Module):
@@ -713,6 +1131,41 @@ class ThreeLayerConv3d(nn.Module):
         x = self.do3(F.gelu(self.bn3(self.fc3(x))))
         return x
 
+
+class TwoLayerConv3d(nn.Module):
+    def __init__(self,
+                 config: Config):
+        super(TwoLayerConv3d, self).__init__()
+        hid = config.hidden_size_3d
+        self.fc = nn.LazyConv3d(hid, (5, 2, 2), bias=False, stride=(3, 1, 1), padding=(0, 1, 1))
+        self.bn = nn.BatchNorm3d(hid)
+        self.do = nn.Dropout(0.2)
+        self.pool = nn.MaxPool3d((3, 1, 1))
+        self.fc2 = nn.LazyConv3d(hid*2, (3, 2, 2), bias=False, stride=(2, 1, 1))
+        self.bn2 = nn.BatchNorm3d(hid*2)
+        self.do2 = nn.Dropout(0.25)
+        self.activation = config.activation()
+
+    def forward(self, x):
+        x = self.pool(self.do(self.activation(self.bn(self.fc(x)))))
+        x = self.do2(self.activation(self.bn2(self.fc2(x))))
+        return x
+
+
+class SimpleConv1D(nn.Module):
+    def __init__(self,
+                 config: Config):
+        super(SimpleConv1D, self).__init__()
+        self.fc = nn.LazyConv1d(config.hidden_size_1d, config.kernel_size_conv1d, stride=config.stride_conv1d, bias=False)
+        self.bn = nn.LazyBatchNorm1d()
+        self.do = nn.Dropout(config.dropout_seq)
+        self.pl = nn.MaxPool2d(config.stride_conv1d)
+        self.activation = config.activation()
+
+    def forward(self, x):
+        x = self.pl(self.do(self.activation(self.bn(self.fc(x)))))
+        return x
+
 class ThreeLayerConv1DUnit(nn.Module):
     def __init__(self,
                  config: Config):
@@ -735,6 +1188,7 @@ class ThreeLayerConv1DUnit(nn.Module):
         x = self.do2(self.activation(self.bn2(self.fc2(x))))
         x = self.do3(self.activation(self.bn3(self.fc3(x))))
         return x
+
 
 class SequenceModel(nn.Module):
     def __init__(self,
@@ -762,15 +1216,19 @@ class SequenceModel(nn.Module):
             )
         elif config.seq_model == "1dcnn":
             self.model = nn.LazyConv1d(
-                out_channels=self.n_frames,
+                out_channels=config.hidden_size_1d,
                 kernel_size=config.kernel_size_conv1d,
                 stride=config.stride_conv1d,
                 bias=False
             )
+        elif config.seq_model == "1dcnn_simple":
+            self.model = SimpleConv1D(config=config)
         elif config.seq_model == "1dcnn_3layers":
             self.model = ThreeLayerConv1DUnit(config)
         elif config.seq_model =="3dcnn_simple":
             self.model = SimpleConv3d(config=config)
+        elif config.seq_model == "3dcnn_2layers":
+            self.model = TwoLayerConv3d(config=config)
         elif config.seq_model == "3dcnn_3layers":
             self.model = ThreeLayerConv3d(config=config)
         else:
@@ -782,6 +1240,70 @@ class SequenceModel(nn.Module):
             return x[0]
         else:
             return x
+
+
+class Model2DTo1D(nn.Module):
+    def __init__(self,
+                 config: Config):
+        super().__init__()
+        self.config = config
+        if "cnn_2d_" in self.config.model_name:
+            self.cnn_2d = timm.create_model(config.model_name.replace("cnn_2d_", ""), num_classes=0, pretrained=True)
+
+        self.seq_model = SequenceModel(
+            hidden_size=self.config.pretrained_feature_dim,
+            config=config
+        )
+        if self.config.fc == "simple":
+            self.fc = nn.LazyLinear(config.n_predict_frames)
+        elif self.config.fc == "2layer":
+            self.fc = nn.Sequential(
+                nn.LazyLinear(32),
+                nn.Dropout(self.config.fc_dropout),
+                nn.GELU(),
+                nn.Linear(32, config.n_predict_frames)
+            )
+        self.fc_weight = nn.LazyLinear(1)
+        if self.config.sep_is_g:
+            self.fc_contact = nn.LazyLinear(config.n_predict_frames)
+            self.fc_g = nn.LazyLinear(config.n_predict_frames)
+        if self.config.calc_single_view_loss:
+            self.fc_endzone = nn.LazyLinear(config.n_predict_frames)
+            self.fc_sideline = nn.LazyLinear(config.n_predict_frames)
+
+    def forward(self, x, is_g, feature):
+        if "cnn_2d_" in self.config.model_name:
+            bs, C, seq_len, W, H = x.shape
+            x = x.permute(0, 2, 1, 3, 4)  # (bs, seq_len*n_view, C, W, H)
+            x = x.reshape(bs * seq_len, C, W, H)  # (bs*seq_len*n_view, C, W, H)
+            x = self.cnn_2d(x)  # (bs*seq_len*n_view, features)
+            x = x.reshape(bs, seq_len, -1)
+
+        bs, seq_len, f_dim = x.shape  # shape = (bs, seq_len*n_view, features)
+        x = x.reshape(bs*2, seq_len//2, f_dim)  # shape = (bs*n_view, seq_len, features)
+
+        x = self.seq_model(x) # (bs*n_view, seq_len, features) -> (bs*n_view, hidden)
+        x = F.adaptive_avg_pool1d(x, 1).squeeze(2)
+
+        x_endzone = None
+        x_sideline = None
+        if self.config.calc_single_view_loss:
+            x_endzone = self.fc_endzone(x[::2])
+            x_sideline = self.fc_sideline(x[1::2])
+        if self.config.fc_sideend == "concat":
+            x = x.reshape(bs, -1)
+            if self.config.sep_is_g:
+                x_contact = self.fc_contact(x)  # (bs, n_predict_frames)
+                x_g = self.fc_g(x)  # (bs, n_predict_frames)
+
+                not_is_g = (is_g == 0)
+                x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
+            else:
+                x = self.fc(x)
+        return x, x_endzone, x_sideline
+
+    def forward_features(self, x):
+        return self.cnn_2d.forward_features(x)
 
 
 class Model2D(nn.Module):
@@ -808,6 +1330,9 @@ class Model2D(nn.Module):
                 nn.Linear(32, config.n_predict_frames)
             )
         self.fc_weight = nn.LazyLinear(1)
+        if self.config.sep_is_g:
+            self.fc_contact = nn.LazyLinear(config.n_predict_frames)
+            self.fc_g = nn.LazyLinear(config.n_predict_frames)
         if self.config.calc_single_view_loss:
             self.fc_endzone = nn.LazyLinear(config.n_predict_frames)
             self.fc_sideline = nn.LazyLinear(config.n_predict_frames)
@@ -824,7 +1349,14 @@ class Model2D(nn.Module):
             x_endzone = self.fc_endzone(x[::2])
             x_sideline = self.fc_sideline(x[1::2])
         x = torch.cat([x[::2], x[1::2]], dim=1)  # (bs, n_view*features)
-        x = self.fc(x)  # (bs, seq_len, n_predict_frames)
+        if self.config.sep_is_g:
+            x_contact = self.fc_contact(x)  # (bs, n_predict_frames)
+            x_g = self.fc_g(x)  # (bs, n_predict_frames)
+
+            not_is_g = (is_g == 0)
+            x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
+        else:
+            x = self.fc(x)  # (bs, seq_len, n_predict_frames)
 
         return x, x_endzone, x_sideline
 
@@ -859,41 +1391,25 @@ class Model2p5D(nn.Module):
         return x, None, None
 
 
-class Model2p5DTo3D(nn.Module):
+class Head2p5DTo3D(nn.Module):
     def __init__(self,
                  config: Config):
         super().__init__()
         self.config = config
-        if config.n_frames % 3 != 0:
-            raise ValueError("n_frames must be able to n_frames % 3 == 0")
-
-        if config.pretrained and not config.submission_mode:
-            pretrained = True
-        else:
-            pretrained = False
-        self.cnn_2d = timm.create_model(config.model_name.replace("cnn_2.5d3d_", ""), num_classes=0, pretrained=pretrained)
         if config.seq_model == "3dcnn_simple":
             self.seq_model = SimpleConv3d(config=config)
         elif config.seq_model == "3dcnn_3layers":
             self.seq_model = ThreeLayerConv3d(config=config)
+        elif config.seq_model == "3dcnn_2layers":
+            self.seq_model = TwoLayerConv3d(config=config)
         elif config.seq_model in ["3dcnn_slowfast", "3dcnn_slowfast_add"]:
             self.seq_model = SlowFastConv3d(config=config)
 
-        if self.config.fc == "simple":
-            self.fc = nn.LazyLinear(config.n_predict_frames)
-        elif self.config.fc == "2layer":
-            self.fc = nn.Sequential(
-                nn.LazyLinear(32),
-                nn.Dropout(self.config.fc_dropout),
-                nn.GELU(),
-                nn.Linear(32, config.n_predict_frames)
-            )
-        self.fc_weight = nn.LazyLinear(1)
+        self.fc = nn.LazyLinear(config.n_predict_frames)
         if self.config.calc_single_view_loss:
             self.fc_endzone = nn.LazyLinear(config.n_predict_frames)
             self.fc_sideline = nn.LazyLinear(config.n_predict_frames)
-        if self.config.g_embedding:
-            self.emb_g = nn.Embedding(2, 16)
+
         if self.config.feature_window > 0:
             self.fc_feature = nn.LazyLinear(self.config.feature_hidden_size)
             transformer_encoder = nn.TransformerEncoderLayer(
@@ -907,24 +1423,8 @@ class Model2p5DTo3D(nn.Module):
                 # norm=nn.LayerNorm(self.config.num_layer_transformer),
             )
 
-    def forward(self, x, is_g, feature):
-        bs, _, seq_len, W, H = x.shape  # C = 1
-        x = x.squeeze(1)  # (bs, n_view*seq_len, W, H)
-        x = x.reshape(bs*(seq_len//3), 3, W, H)  # (bs*n_view*seq_len//3, 3, W, H)
-        x = self.cnn_2d.forward_features(x)  # (bs*n_view*seq_len//3, C, W, H)
-        bs_, C_, W_, H_ = x.shape
-
-        x = x.reshape(bs*2, (seq_len//6), C_, W_, H_)  # (bs*n_view, seq_len//3, C, W, H)
+    def forward(self, x, feature):
         x = self.seq_model(x)  # (bs*n_view*seq_len//3, feature)
-
-        if self.config.feature_window > 0:
-            feature = self.fc_feature(feature)  # (bs, feature_window, feature_hidden_size)
-            feature = self.transformer(feature)  # (bs, feature_window, feature_hidden_size)
-
-            if self.config.feature_mean_dim == "feature":
-                feature = feature.mean(dim=2)  # (bs, feature_window)
-            elif self.config.feature_mean_dim == "window":
-                feature = feature.mean(dim=1)  # (bs, feature_hidden_size)
 
         if self.config.seq_model == "3dcnn_slowfast":
             x_slow = F.adaptive_avg_pool3d(x[0], 1).squeeze(4).squeeze(3).squeeze(2)
@@ -940,6 +1440,16 @@ class Model2p5DTo3D(nn.Module):
 
         x_endzone = None
         x_sideline = None
+
+        if self.config.feature_window > 0:
+            feature = self.fc_feature(feature)  # (bs, feature_window, feature_hidden_size)
+            feature = self.transformer(feature)  # (bs, feature_window, feature_hidden_size)
+
+            if self.config.feature_mean_dim == "feature":
+                feature = feature.mean(dim=2)  # (bs, feature_window)
+            elif self.config.feature_mean_dim == "window":
+                feature = feature.mean(dim=1)  # (bs, feature_hidden_size)
+
         if self.config.calc_single_view_loss:
             x_endzone = self.fc_endzone(x[::2])
             x_sideline = self.fc_sideline(x[1::2])
@@ -952,13 +1462,47 @@ class Model2p5DTo3D(nn.Module):
             x = x_endzone + x_sideline
         elif self.config.fc_sideend == "concat":
             x = torch.cat([x[::2], x[1::2]], dim=1)
-            if self.config.g_embedding:
-                x_emb_g = self.emb_g(is_g).squeeze(1)
-                x = torch.cat([x, x_emb_g], dim=1)
             if self.config.feature_window > 0:
                 x = torch.cat([x, feature], dim=1)
             x = self.fc(x)
+        return x, x_endzone, x_sideline
 
+
+class Model2p5DTo3D(nn.Module):
+    def __init__(self,
+                 config: Config):
+        super().__init__()
+        self.config = config
+        if config.n_frames % config.channel_3d != 0:
+            raise ValueError(f"n_frames must be able to n_frames % channel_3d == 0")
+
+        if config.pretrained and not config.submission_mode:
+            pretrained = True
+        else:
+            pretrained = False
+        if config.channel_3d != 3:
+            self.cnn_2d = timm.create_model(config.model_name.replace("cnn_2.5d3d_", ""), num_classes=0,
+                                            pretrained=pretrained, in_chans=config.channel_3d)
+        else:
+            self.cnn_2d = timm.create_model(config.model_name.replace("cnn_2.5d3d_", ""), num_classes=0, pretrained=pretrained)
+        self.head_g = Head2p5DTo3D(config=config)
+        self.head_contact = Head2p5DTo3D(config=config)
+
+    def forward(self, x, is_g, feature):
+        bs, _, seq_len, W, H = x.shape  # C = 1
+        x = x.squeeze(1)  # (bs, n_view*seq_len, W, H)
+        x = x.reshape(bs*(seq_len//self.config.channel_3d), self.config.channel_3d, W, H)  # (bs*n_view*seq_len//channel_3d, channel_3d, W, H)
+        x = self.cnn_2d.forward_features(x)  # (bs*n_view*seq_len//3, C, W, H)
+        bs_, C_, W_, H_ = x.shape
+
+        x = x.reshape(bs*2, seq_len//(self.config.channel_3d*2), C_, W_, H_)  # (bs*n_view, seq_len//3, C, W, H)
+        x_g, x_endzone_g, x_sideline_g = self.head_g(x, feature)
+        x_contact, x_endzone_contact, x_sideline_contact = self.head_contact(x, feature)
+
+        not_is_g = (is_g == 0)
+        x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
+        x_endzone = x_endzone_contact * not_is_g + x_endzone_g * is_g
+        x_sideline = x_sideline_contact * not_is_g + x_sideline_g * is_g
         return x, x_endzone, x_sideline
 
 
@@ -994,15 +1538,23 @@ class Model3D(nn.Module):
             self.fc_endzone = nn.LazyLinear(config.n_predict_frames)
             self.fc_sideline = nn.LazyLinear(config.n_predict_frames)
 
-        if self.config.fc == "simple":
-            self.fc = nn.LazyLinear(config.n_predict_frames)
-        elif self.config.fc == "2layer":
-            self.fc = nn.Sequential(
-                nn.LazyLinear(32),
-                nn.Dropout(self.config.fc_dropout),
-                nn.GELU(),
-                nn.Linear(32, config.n_predict_frames)
-            )
+        if self.config.sep_is_g:
+            if self.config.fc == "2layer":
+                raise NotImplementedError
+            if self.config.fc_sideend != "concat":
+                raise NotImplementedError
+            self.fc_contact = nn.LazyLinear(config.n_predict_frames)
+            self.fc_g = nn.LazyLinear(config.n_predict_frames)
+        else:
+            if self.config.fc == "simple":
+                self.fc = nn.LazyLinear(config.n_predict_frames)
+            elif self.config.fc == "2layer":
+                self.fc = nn.Sequential(
+                    nn.LazyLinear(32),
+                    nn.Dropout(self.config.fc_dropout),
+                    nn.GELU(),
+                    nn.Linear(32, config.n_predict_frames)
+                )
 
         if self.config.fc_sideend == "add_weight":
             self.fc_weight = nn.LazyLinear(1)
@@ -1062,7 +1614,14 @@ class Model3D(nn.Module):
                 x = torch.cat([x, x_emb_g], dim=1)
             if self.config.feature_window > 0:
                 x = torch.cat([x, feature], dim=1)
-            x = self.fc(x)
+            if self.config.sep_is_g:
+                x_contact = self.fc_contact(x)  # (bs, n_predict_frames)
+                x_g = self.fc_g(x)  # (bs, n_predict_frames)
+
+                not_is_g = (is_g == 0)
+                x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
+            else:
+                x = self.fc(x)
 
         return x, x_endzone, x_sideline
 
@@ -1136,7 +1695,7 @@ def main(config):
             f"{config.data_dir}/gps.feather",
             columns=[
                 "contact_id", "game_play", "step", "nfl_player_id_1", "nfl_player_id_2", "contact", "frame", "view", "distance",
-                "game_key", "speed_1", "speed_2"
+                "game_key", "speed_1", "speed_2", "distance_1", "acceleration_1", "team_1", "team_2"
             ]
         )
         gkfold = GroupKFold(5)
@@ -1154,10 +1713,14 @@ def main(config):
                 logger.info("calc_single_view_loss not be implemented")
                 config.calc_single_view_loss = False
             model = Model2p5D(config=config)
-        elif "cnn_2d_" in config.model_name:
-            logger.info("set n_frames = 1")
-            config.n_frames = 1
+        elif "cnn_2d_" in config.model_name and config.n_frames == 1:
             model = Model2D(config=config)
+        elif config.model_name == "cnn_2d1d" or "cnn_2d_" in config.model_name:
+            model = Model2DTo1D(config=config)
+        elif type(config) == ConfigForGNN:
+            model = NFLGraphModel(config=config)
+        elif type(config) == ConfigForTransformer:
+            model = TransformerModel(config=config)
         else:
             raise ValueError
 
@@ -1165,8 +1728,13 @@ def main(config):
         for train_idx, val_idx in gkfold.split(df_label, groups=df_label["game_key"].values):
             df_label_train = df_label.iloc[train_idx]
             df_label_val = df_label.iloc[val_idx]
-            df_train = df[df["game_key"].isin(df_label_train["game_key"].values)]
-            df_val = df[df["game_key"].isin(df_label_val["game_key"].values)]
+            if type(config) == ConfigForTransformer:
+                df_feature = pd.read_feather(config.feature_dir)
+                df_train = df_feature[df_feature["game_play"].isin(df_label_train["game_play"].values)]
+                df_val = df_feature[df_feature["game_play"].isin(df_label_val["game_play"].values)]
+            else:
+                df_train = df[df["game_key"].isin(df_label_train["game_key"].values)]
+                df_val = df[df["game_key"].isin(df_label_val["game_key"].values)]
             break
         df_merge = pd.merge(
             df_label[["contact_id", "contact"]],
@@ -1177,57 +1745,118 @@ def main(config):
         logger.info(f"possible MCC score: {possible_score_all}")
         del df; gc.collect()
 
-        train_dataset = NFLDataset(
-            df=df_train,
-            base_dir=f"{base_dir}/{config.image_path}",
-            logger=logger,
-            config=config,
-            test=False
-        )
-
-        val_dataset = NFLDataset(
-            df=df_val,
-            base_dir=f"{base_dir}/{config.image_path}",
-            logger=logger,
-            config=config,
-            test=True
-        )
-        df_val_dataset = pd.concat([get_df_from_item(item) for item in val_dataset.items])
-        df_merge = pd.merge(
-            df_label_val[["contact_id", "contact"]],
-            df_val_dataset[["contact_id", "contact"]].rename(columns={"contact": "pred"}),
-            how="left"
-        ).fillna(0).sort_values("contact", ascending=False).drop_duplicates("contact_id")
-        del df_train, df_val; gc.collect()
-        possible_score_extracted = matthews_corrcoef(df_merge["contact"].values, df_merge["pred"].values)
-        logger.info(f"possible MCC score: {possible_score_extracted}")
-        del df_merge, df_label, df_label_train, df_label_val; gc.collect()
-
         if config.debug:
-            train_dataset.items = train_dataset.items[:200]
-            val_dataset.items = val_dataset.items[:200]
-
-        if config.debug:
-            num_workers = 1
+            num_workers = 0
+        elif type(config) == ConfigForGNN in config.model_name:
+            num_workers = 0
+        elif "cnn_2d_" in config.model_name and config.n_frames == 1:
+            num_workers = 2
+        elif config.model_name == "cnn_2d1d":
+            num_workers = 0
+        elif type(config) == ConfigForTransformer:
+            num_workers = 0
         else:
             num_workers = 16
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.batch_size,
-            shuffle=True,
-            pin_memory=True,
-            drop_last=True,
-            num_workers=num_workers
-        )
+        use_filelist = True
+        if config.model_name == "cnn_2d1d":
+            use_filelist = False
 
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            pin_memory=True,
-            drop_last=False,
-            num_workers=num_workers
-        )
+        if type(config) != ConfigForGNN:
+            if type(config) == Config:
+                train_dataset = NFLDataset(
+                    df=df_train,
+                    base_dir=f"{base_dir}/{config.image_path}",
+                    logger=logger,
+                    config=config,
+                    test=False,
+                    use_filelist=use_filelist
+                )
+
+                val_dataset = NFLDataset(
+                    df=df_val,
+                    base_dir=f"{base_dir}/{config.image_path}",
+                    logger=logger,
+                    config=config,
+                    test=True,
+                    use_filelist=use_filelist
+                )
+            elif type(config) == ConfigForTransformer:
+                train_dataset = NFLTransformerDataset(
+                    df=df_train,
+                    base_dir=f"{base_dir}/{config.image_path}",
+                    logger=logger,
+                    config=config,
+                    test=False,
+                )
+
+                val_dataset = NFLTransformerDataset(
+                    df=df_val,
+                    base_dir=f"{base_dir}/{config.image_path}",
+                    logger=logger,
+                    config=config,
+                    test=True,
+                )
+            df_val_dataset = pd.concat([get_df_from_item(item) for item in val_dataset.items])
+            df_merge = pd.merge(
+                df_label_val[["contact_id", "contact"]],
+                df_val_dataset[["contact_id", "contact"]].rename(columns={"contact": "pred"}),
+                how="left"
+            ).fillna(0).sort_values("contact", ascending=False).drop_duplicates("contact_id")
+            possible_score_extracted = matthews_corrcoef(df_merge["contact"].values, df_merge["pred"].values)
+            logger.info(f"possible MCC score: {possible_score_extracted}")
+
+            if config.debug:
+                train_dataset.items = train_dataset.items[:200]
+                val_dataset.items = val_dataset.items[:200]
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=config.batch_size,
+                shuffle=True,
+                pin_memory=True,
+                drop_last=True,
+                num_workers=num_workers
+            )
+
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=config.batch_size,
+                shuffle=False,
+                pin_memory=True,
+                drop_last=False,
+                num_workers=num_workers
+            )
+        else:
+            train_dataset = NFLGraphDataset(
+                df=df_train,
+                config=config,
+            )
+
+            val_dataset = NFLGraphDataset(
+                df=df_val,
+                config=config,
+            )
+
+            train_loader = GraphDataLoader(
+                train_dataset,
+                batch_size=config.batch_size,
+                shuffle=True,
+                pin_memory=True,
+                drop_last=True,
+                num_workers=num_workers,
+            )
+
+            val_loader = GraphDataLoader(
+                val_dataset,
+                batch_size=config.batch_size,
+                shuffle=False,
+                pin_memory=True,
+                drop_last=False,
+                num_workers=num_workers,
+            )
+            possible_score_extracted = possible_score_all
+
+        del df_train, df_val; gc.collect()
+        del df_merge, df_label, df_label_train, df_label_val; gc.collect()
 
         model = model.to(device)
         def get_params(k, params):
@@ -1280,7 +1909,6 @@ def main(config):
         })
         wandb.config.update({"output_dir": output_dir})
         total_best_score = -1
-        total_best_auc = -1
         for epoch in range(config.epochs):
             logger.info(f"===============================")
             logger.info(f"epoch {epoch + 1}")
@@ -1310,32 +1938,31 @@ def main(config):
                 df_label_val = df_label.iloc[val_idx]
                 break
 
-            scheduler.base_lrs = [lr_ * config.lr_reduce_ratio for lr_ in scheduler.base_lrs]
             df_merge = pd.merge(df_label_val, df_pred, how="left")
 
             logger.info(f"loss: train {train_loss}, val {valid_loss}")
             logger.info(f"------ MCC ------")
             df_score = df_merge.groupby(["contact_id", "contact"], as_index=False)["score"].apply(np.mean)
 
-            logger.info(f"[all]")
-            label = df_score["contact"].values
-            pred = df_score["score"].fillna(0).values
-            auc, best_th, best_score = calc_best(label, pred, logger, epoch, name="all")
-
             logger.info(f"\n[G]")
             w_df = df_score[df_score["contact_id"].str.contains("G")]
-            label = w_df["contact"].values
-            pred = w_df["score"].fillna(0).values
-            _, _, best_score_g = calc_best(label, pred, logger, epoch, name="g")
+            label_g = w_df["contact"].values
+            pred_g = w_df["score"].fillna(0).values
+            _, best_th_g, best_score_g = calc_best(label_g, pred_g, logger, epoch, name="g")
 
             logger.info(f"\n[Contact]")
             w_df = df_score[~df_score["contact_id"].str.contains("G")]
-            label = w_df["contact"].values
-            pred = w_df["score"].fillna(0).values
-            _, _, best_score_contact = calc_best(label, pred, logger, epoch, name="contact")
+            label_contact = w_df["contact"].values
+            pred_contact = w_df["score"].fillna(0).values
+            _, best_th_contact, best_score_contact = calc_best(label_contact, pred_contact, logger, epoch, name="contact")
+
+            best_score = matthews_corrcoef(
+                np.concatenate([label_g, label_contact]),
+                np.concatenate([pred_g > best_th_g, pred_contact > best_th_contact]),
+            )
 
             logger.info(f"***************** epoch {epoch} *****************")
-            logger.info(f"best: {best_score} (th={best_th})")
+            logger.info(f"best: {best_score}")
             logger.info(f"******************************************")
             pd.merge(df_label_val, df_pred, how="left").to_csv(f"{output_dir}/pred_{epoch}.csv", index=False)
             if not config.debug:
@@ -1346,23 +1973,21 @@ def main(config):
                 "score": best_score,
                 "train_loss": train_loss,
                 "val_loss": valid_loss,
-                "th": best_th,
             })
             wandb.log({
                 "val_loss": valid_loss,
                 "score": best_score,
                 "score_g": best_score_g,
                 "score_contact": best_score_contact,
-                "epoch": 0,
+                "epoch": epoch,
             })
             if total_best_score < best_score:
                 total_best_score = best_score
-                total_best_auc = auc
                 wandb.log({
                     "best_score": total_best_score,
-                    "best_auc": total_best_auc,
-                    "threshold": best_th,
-                    "epoch": 0,
+                    "best_score_g": best_score_g,
+                    "best_score_contact": best_score_contact,
+                    "epoch": epoch,
                 })
 
             pd.DataFrame(results).to_csv(f"{output_dir}/results.csv", index=False)
@@ -1374,504 +1999,27 @@ def main(config):
         wandb.finish()
     except Exception as e:
         print(e)
+        raise
 
 
 if __name__ == "__main__":
-
-    # exp_name = f"2d_pretrain"
-    # config = Config(exp_name=exp_name, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 batch_size=512,
-    #                 lr_fc=1e-3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # batch_size = 32
-    #
-    # exp_name = f"2.5d3d_baseline"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 batch_size=batch_size,
-    #                 lr_fc=1e-3,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    # #
-    # exp_name = f"2.5d3d_drop_frame0.1"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 p_drop_frame=0.1,
-    #                 batch_size=batch_size,
-    #                 lr_fc=1e-3,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # kernel_size = (7, 4, 4)
-    # stride = (2, 1, 1)
-    # exp_name = f"2.5d3d_kernel{kernel_size}_stride{stride}"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 kernel_size_3d=kernel_size,
-    #                 stride_3d=stride,
-    #                 weight_decay=0.1,
-    #                 batch_size=batch_size,
-    #                 lr_fc=1e-3,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # exp_name = f"2.5d3d_hidden128"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=128,
-    #                 weight_decay=0.1,
-    #                 batch_size=batch_size,
-    #                 lr_fc=1e-3,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # exp_name = f"2.5d3d_hidden1024"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=1024,
-    #                 weight_decay=0.1,
-    #                 batch_size=batch_size,
-    #                 lr_fc=1e-3,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    # #
-    # exp_name = f"2.5d3d_wd0.01"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.01,
-    #                 batch_size=batch_size,
-    #                 lr_fc=1e-3,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # kernel_size = (13, 5, 5)
-    # stride = (4, 1, 1)
-    # exp_name = f"2.5d3d_kernel{kernel_size}_stride{stride}_hiddensize1024"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=1024,
-    #                 kernel_size_3d=kernel_size,
-    #                 stride_3d=stride,
-    #                 weight_decay=0.1,
-    #                 batch_size=batch_size,
-    #                 lr_fc=1e-3,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # exp_name = f"2.5d3d_stepratio0.25"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 step_size_ratio=0.25,
-    #                 batch_size=batch_size,
-    #                 lr_fc=1e-3,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # exp_name = f"2.5d3d_slowfast"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_slowfast",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 batch_size=batch_size,
-    #                 lr_fc=1e-3,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # exp_name = f"2.5d3d_existframe0.05"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 exist_image_threshold=0.05,
-    #                 weight_decay=0.1,
-    #                 batch_size=batch_size,
-    #                 lr_fc=1e-3,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    #
-    # exp_name = f"2.5d3d_predict_frames1"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_slowfast",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 exist_image_threshold=0.05,
-    #                 weight_decay=0.1,
-    #                 batch_size=batch_size,
-    #                 lr_fc=1e-3,
-    #                 n_predict_frames=1,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-
-    # exp_name = f"2d_pretrain"
-    # config = Config(exp_name=exp_name, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 batch_size=512,
-    #                 lr_fc=1e-3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # batch_size = 96
-    #
-    # for lr_ratio in [2, 3, 5]:
-    #     exp_name = f"2.5d3d_baseline_bs96_lr*{lr_ratio}"
-    #     config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                     model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                     negative_sample_ratio_g=1,
-    #                     negative_sample_ratio_far=1,
-    #                     negative_sample_ratio_close=1,
-    #                     hidden_size_3d=512,
-    #                     weight_decay=0.1,
-    #                     batch_size=batch_size,
-    #                     lr_fc=1e-3*lr_ratio,
-    #                     lr=1e-4*lr_ratio,
-    #                     n_predict_frames=3,
-    #                     calc_single_view_loss_weight=1,
-    #                     )
+    # for epochs in [5]:
+    #     exp_name = f"transformer_5epochs"
+    #     config = ConfigForTransformer(exp_name=exp_name, hidden_size_transformer=128, epochs=epochs, warmup_ratio=0.05)
     #     main(config)
 
-    # n_frames = 31
-    # step = 4
-    # exp_name = f"3d_72x96_n_frames{n_frames}_step{step}"
-    # config = Config(exp_name=exp_name, n_frames=n_frames, seq_model="flatten",
-    #                 model_name="cnn_3d_r3d_18", epochs=1,
-    #                 n_predict_frames=3,
-    #                 step=step,
-    #                 lr_fc=1e-3,
-    #                 calc_single_view_loss_weight=1,
-    #                 img_shape=(72, 96),
-    #                 image_path="images_96x72_v6",
-    #                 )
-    # main(config)
-    #
-    # n_frames = 31
-    # step = 3
-    # exp_name = f"3d_72x96_n_frames{n_frames}_step{step}"
-    # config = Config(exp_name=exp_name, n_frames=n_frames, seq_model="flatten",
-    #                 model_name="cnn_3d_r3d_18", epochs=1,
-    #                 n_predict_frames=3,
-    #                 step=step,
-    #                 lr_fc=1e-3,
-    #                 calc_single_view_loss_weight=1,
-    #                 img_shape=(72, 96),
-    #                 image_path="images_96x72_v6",
-    #                 )
-    # main(config)
-    #
-    # n_frames = 87
-    # step = 3
-    # exp_name = f"3d_72x96_n_frames{n_frames}_step{step}"
-    # config = Config(exp_name=exp_name, n_frames=n_frames, seq_model="flatten",
-    #                 model_name="cnn_3d_r3d_18", epochs=1,
-    #                 n_predict_frames=3,
-    #                 step=step,
-    #                 lr_fc=1e-3,
-    #                 calc_single_view_loss_weight=1,
-    #                 img_shape=(72, 96),
-    #                 image_path="images_96x72_v6",
-    #                 )
-    # main(config)
-    #
-    # batch_size = 32
-    # exp_name = f"2.5d3d_v7"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 batch_size=batch_size,
-    #                 img_shape=(96, 128),
-    #                 image_path="images_128x96_v7",
-    #                 lr_fc=1e-3,
-    #                 lr=1e-4,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # n_frames = 31
-    # step = 3
-    # exp_name = f"3d_72x96_v7"
-    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 model_name="cnn_3d_r3d_18", epochs=1,
-    #                 n_predict_frames=3,
-    #                 step=3,
-    #                 lr_fc=1e-3,
-    #                 calc_single_view_loss_weight=1,
-    #                 img_shape=(96, 128),
-    #                 image_path="images_128x96_v7",
-    #                 )
-    # main(config)
-    #
-    #
-    # batch_size = 96
-    #
-    # for lr_ratio in [2, 3, 5]:
-    #     exp_name = f"2.5d3d_baseline_bs96_lrratio{lr_ratio}"
-    #     config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                     model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                     negative_sample_ratio_g=1,
-    #                     negative_sample_ratio_far=1,
-    #                     negative_sample_ratio_close=1,
-    #                     hidden_size_3d=512,
-    #                     weight_decay=0.1,
-    #                     batch_size=batch_size,
-    #                     lr_fc=1e-3*lr_ratio,
-    #                     lr=1e-4*lr_ratio,
-    #                     n_predict_frames=3,
-    #                     calc_single_view_loss_weight=1,
-    #                     )
-    #     main(config)
-
-    # exp_name = f"2.5d3d_slowfast_add"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_slowfast_add",
-    #                 fc_sideend="add",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 lr_fc=1e-3,
-    #                 lr=1e-4,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # exp_name = f"2.5d3d_add"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 fc_sideend="add",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 lr_fc=1e-3,
-    #                 lr=1e-4,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # exp_name = f"2.5d3d_n_predict_frames1"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 lr_fc=1e-3,
-    #                 lr=1e-4,
-    #                 n_predict_frames=1,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # exp_name = f"2.5d3d_v6_96x72"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 img_shape=(72, 96),
-    #                 image_path="images_96x72_v6",
-    #                 lr_fc=1e-3,
-    #                 lr=1e-4,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # exp_name = f"2d_pretrain"
-    # config = Config(exp_name=exp_name, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 batch_size=512,
-    #                 lr_fc=1e-3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # batch_size = 32
-    # exp_name = f"2.5d3d_v7"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 batch_size=batch_size,
-    #                 img_shape=(96, 128),
-    #                 image_path="images_128x96_v7",
-    #                 lr_fc=1e-3,
-    #                 lr=1e-4,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-
-    # exp_name = f"2d_pretrain"
-    # config = Config(exp_name=exp_name, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 batch_size=512,
-    #                 lr_fc=1e-3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-
-    # for exist_center_frame_threshold in [0.25, 0.5]:
-    #     exp_name = f"2.5d3d_baseline_n_predict_frame7_exist_center_{exist_center_frame_threshold}"
-    #     config = Config(exp_name=exp_name, n_frames=111, seq_model="3dcnn_simple",
-    #                     model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                     negative_sample_ratio_g=1,
-    #                     negative_sample_ratio_far=1,
-    #                     negative_sample_ratio_close=1,
-    #                     hidden_size_3d=512,
-    #                     weight_decay=0.1,
-    #                     lr_fc=1e-3,
-    #                     exist_center_image_threshold=exist_center_frame_threshold,
-    #                     n_predict_frames=9,
-    #                     calc_single_view_loss_weight=1,
-    #                     )
-    #     main(config)
-
-    # for n_frame in [177, 141, 111]:
-    #     exp_name = f"2.5d3d_nframe{n_frame}"
-    #     config = Config(exp_name=exp_name, n_frames=n_frame, seq_model="3dcnn_simple",
-    #                     model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                     negative_sample_ratio_g=1,
-    #                     negative_sample_ratio_far=1,
-    #                     negative_sample_ratio_close=1,
-    #                     hidden_size_3d=512,
-    #                     weight_decay=0.1,
-    #                     lr_fc=1e-3,
-    #                     n_predict_frames=3,
-    #                     calc_single_view_loss_weight=1,
-    #                     )
-    #     main(config)
-
-    # batch_size = 32
-    # exp_name = f"2.5d3d_v9"
-    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=1, step=3,
-    #                 negative_sample_ratio_g=1,
-    #                 negative_sample_ratio_far=1,
-    #                 negative_sample_ratio_close=1,
-    #                 hidden_size_3d=512,
-    #                 weight_decay=0.1,
-    #                 batch_size=batch_size,
-    #                 img_shape=(96, 128),
-    #                 image_path="images_128x96_v9",
-    #                 lr_fc=1e-3,
-    #                 lr=1e-4,
-    #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-
-    exp_name = f"2d_pretrain_v9"
-    config = Config(exp_name=exp_name, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2d_legacy_seresnet18", epochs=1, step=3,
-                    negative_sample_ratio_g=1,
-                    negative_sample_ratio_far=1,
-                    negative_sample_ratio_close=1,
+    exp_name = f"2.5d3d_v10_baseline(separate_g_seqmodel)"
+    config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+                    step_size_ratio=0.6,
                     hidden_size_3d=512,
-                    weight_decay=0.1,
-                    batch_size=512,
-                    image_path="images_128x96_v9",
+                    negative_sample_ratio_close=0.2,
+                    negative_sample_ratio_far=0.2,
+                    gradient_clipping=10,
+                    interpolate_image=False,
                     lr_fc=1e-3,
+                    lr=1e-4,
+                    n_predict_frames=3,
                     calc_single_view_loss_weight=1,
                     )
     main(config)

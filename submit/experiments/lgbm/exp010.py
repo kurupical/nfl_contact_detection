@@ -16,7 +16,6 @@ try:
     import mlflow
 except Exception as e:
     print(e)
-import pickle
 
 pd.set_option("max_row", 1000)
 pd.set_option("max_column", 200)
@@ -114,11 +113,6 @@ class LGBMModel:
         ]
         self.use_features = use_features
         self.fast_mode = fast_mode
-        self.agg_dict = {
-            "game_play": {},
-            "is_same_team": {},
-            "is_g": {},
-        }
 
     def feature_engineering(self,
                             df: pd.DataFrame,
@@ -137,18 +131,16 @@ class LGBMModel:
         self.logger.info(f"[aggregate view]before: {len(df)}")
         helmet_columns = [
             "left_1", "width_1", "top_1", "height_1", "x_1", "y_1",
-            "left_2", "width_2", "top_2", "height_2", "x_2", "y_2",
+            "left_2", "width_2", "top_2", "height_2", "x_2", "y_2"
         ]
-        df["contact_id"] = df["game_play"] + "_" + df["step"].astype(str) + "_" + df["nfl_player_id_1"].astype(
-            str) + "_" + df["nfl_player_id_2"].astype(str)
         df_endzone = df[df["view"] == "Endzone"].drop("view", axis=1)
         df_sideline = df[df["view"] == "Sideline"].drop("view", axis=1)
         df_endzone.columns = [f"Endzone_{col}" if col in helmet_columns else col for col in df_endzone.columns]
         df_sideline.columns = [f"Sideline_{col}" if col in helmet_columns else col for col in df_sideline.columns]
+
         df = df[["contact_id"]].drop_duplicates()
         df = pd.merge(df, df_endzone, how="left")
         df = pd.merge(df, df_sideline, how="left")
-        df = df.sort_values(["game_play", "step", "nfl_player_id_1", "nfl_player_id_2"])
         self.logger.info(f"[aggregate view]after: {len(df)}")
 
         player_features = [
@@ -195,7 +187,7 @@ class LGBMModel:
         df["move_sensor"] = df["distance_1"] + df["distance_2"]
 
         df["is_same_team"] = df["team_1"] == df["team_2"]
-        df["is_g"] = df["nfl_player_id_2"] == "G"
+        df["is_G"] = df["nfl_player_id_2"] == "G"
 
         for col in ["orientation", "direction"]:
             for col2 in ["acceleration", "speed"]:
@@ -301,9 +293,7 @@ class LGBMModel:
 
         for agg_col in tqdm.tqdm(agg_col2):
             col_name = f"{agg_col}_groupby_is_same_team"
-            if not inference:
-                self.agg_dict["is_same_team"][agg_col] = df_rets2.groupby("is_same_team")[agg_col].mean().to_dict()
-            mean = df_rets2["is_same_team"].map(self.agg_dict["is_same_team"][agg_col])
+            mean = df_rets2.groupby("is_same_team")[agg_col].transform("mean")
             df_rets2[f"diff_{col_name}"] = df_rets2[agg_col] - mean
 
         agg_col3 = [
@@ -328,22 +318,18 @@ class LGBMModel:
         ]
         for agg_col in tqdm.tqdm(agg_col3):
             col_name = f"{agg_col}_groupby_is_g"
-            if not inference:
-                self.agg_dict["is_g"][agg_col] = df_rets2.groupby("is_g")[agg_col].mean().to_dict()
-            mean = df_rets2["is_g"].map(self.agg_dict["is_g"][agg_col])
+            mean = df_rets2.groupby("is_G")[agg_col].transform("mean")
             df_rets2[f"diff_{col_name}"] = df_rets2[agg_col] - mean
 
         self.logger.info("Reduce memory usage")
         df_rets2 = reduce_mem_usage(df_rets2)
 
-        self.logger.info(f"feature engineering end! {df_rets2.shape}")
-        df_rets2 = df_rets2[df_rets2["contact"].notnull()].reset_index(drop=True)
-        self.logger.info(f"drop contact=null {df_rets2.shape}")
         if not inference:
             self.logger.info("save feather")
             os.makedirs(os.path.dirname(feature_path), exist_ok=True)
             df_rets2.to_feather(feature_path)
 
+        self.logger.info(f"feature engineering end! {df_rets2.shape}")
         return df_rets2
 
     def train(self,
@@ -452,73 +438,54 @@ class LGBMModel:
 
 
 def main():
-    output_dir = f"../../output/lgbm/{os.path.basename(__file__).replace('.py', '')}/{dt.now().strftime('%Y%m%d%H%M%S')}"
-    os.makedirs(output_dir, exist_ok=True)
-    shutil.copy(__file__, output_dir)
-    logger = get_logger(output_dir)
-    df = pd.read_feather("../../output/preprocess/master_data_v4/gps.feather")
-    if debug:
-        df = df.head(300000)
 
-    params = {
-        'objective': 'binary',
-        'metrics': 'auc',
-        'num_leaves': 128,
-        'max_depth': -1,
-        'bagging_fraction': 0.9,  # 0.5,
-        'feature_fraction': 0.3,
-        'bagging_seed': 0,
-        'reg_alpha': 10,
-        'reg_lambda': 5,
-        'min_data_in_leaf': 10000,
-        'random_state': 0,
-        'verbosity': -1,
-        "n_estimators": 20000,
-        "early_stopping_rounds": 100,
-        "learning_rate": 0.1,
-        "n_jobs": 8
-    }
-    use_features = pd.read_csv("../../output/lgbm/exp010/20230115181755/feature_importance.csv")["col"].values[:400]
-
-    model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
-                      params=params)
-    model.train(df)
-    del model.logger
-
-    with open(f"{output_dir}/model.pickle", "wb") as f:
-        pickle.dump(model, f)
-
-    # for _ in range(1000):
+    # for n_use_features in [50, 100, 200]:
     #     output_dir = f"../../output/lgbm/{os.path.basename(__file__).replace('.py', '')}/{dt.now().strftime('%Y%m%d%H%M%S')}"
     #     os.makedirs(output_dir, exist_ok=True)
     #     shutil.copy(__file__, output_dir)
     #     logger = get_logger(output_dir)
     #
-    #     df = pd.read_feather("../../output/preprocess/master_data_v3/gps.feather")
+    #     df = pd.read_feather("../../output/preprocess/master_data_v2/gps.feather")
     #     if debug:
     #         df = df.head(300000)
     #
-    #     params = {
-    #         'objective': 'binary',
-    #         'metrics': 'auc',
-    #         'num_leaves': np.random.choice([16, 32, 64, 128, 256]),
-    #         'max_depth': -1,
-    #         'bagging_fraction': np.random.choice([0.7, 0.9]),  # 0.5,
-    #         'feature_fraction': np.random.choice([0.1, 0.3, 0.5, 0.7, 0.9]),
-    #         'bagging_seed': 0,
-    #         'reg_alpha': np.random.choice([0, 0.1, 0.5, 1, 3, 5, 10]),
-    #         'reg_lambda': np.random.choice([0, 0.1, 0.5, 1, 3, 5, 10]),
-    #         'min_data_in_leaf': np.random.choice([1, 10, 50, 100, 500, 1000, 5000, 10000]),
-    #         'random_state': 0,
-    #         'verbosity': -1,
-    #         "n_estimators": 20000,
-    #         "early_stopping_rounds": 100,
-    #         "learning_rate": 0.1,
-    #         "n_jobs": 8
-    #     }
-    #     model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
-    #                       params=params, use_features=use_features)
+    #     use_features = pd.read_csv("../../output/lgbm/exp004/20230106205611/feature_importance.csv")["col"].values[:n_use_features]
+    #     model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp005_top10", debug=debug, use_features=use_features)
     #     model.train(df)
+
+    use_features = pd.read_csv("../../output/lgbm/exp010/20230115181755/feature_importance.csv")["col"].values[:400]
+
+    for _ in range(1000):
+        output_dir = f"../../output/lgbm/{os.path.basename(__file__).replace('.py', '')}/{dt.now().strftime('%Y%m%d%H%M%S')}"
+        os.makedirs(output_dir, exist_ok=True)
+        shutil.copy(__file__, output_dir)
+        logger = get_logger(output_dir)
+
+        df = pd.read_feather("../../output/preprocess/master_data_v3/gps.feather")
+        if debug:
+            df = df.head(300000)
+
+        params = {
+            'objective': 'binary',
+            'metrics': 'auc',
+            'num_leaves': np.random.choice([16, 32, 64, 128, 256]),
+            'max_depth': -1,
+            'bagging_fraction': np.random.choice([0.7, 0.9]),  # 0.5,
+            'feature_fraction': np.random.choice([0.1, 0.3, 0.5, 0.7, 0.9]),
+            'bagging_seed': 0,
+            'reg_alpha': np.random.choice([0, 0.1, 0.5, 1, 3, 5, 10]),
+            'reg_lambda': np.random.choice([0, 0.1, 0.5, 1, 3, 5, 10]),
+            'min_data_in_leaf': np.random.choice([1, 10, 50, 100, 500, 1000, 5000, 10000]),
+            'random_state': 0,
+            'verbosity': -1,
+            "n_estimators": 20000,
+            "early_stopping_rounds": 100,
+            "learning_rate": 0.1,
+            "n_jobs": 8
+        }
+        model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
+                          params=params, use_features=use_features)
+        model.train(df)
 
 if __name__ == "__main__":
     main()
