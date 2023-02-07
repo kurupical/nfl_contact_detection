@@ -6,17 +6,17 @@ import tqdm
 
 
 CONTACT = (0, 0, 0)
-AWAY = (0, 78, 255)
-HOME = (255, 255, 255)
-PLAYER = (255, 0, 0)
+AWAY = (0, 0, 255)
+HOME = (128, 255, 0)
+G = (255, 255, 255)
 output_size = (128, 96)
-output_dir = f"../../../work/images_{output_size[0]}x{output_size[1]}_v12"
+output_dir = f"../../../work/images_{output_size[0]}x{output_size[1]}_v19"
 traintest = "train"
 
 bbox_left_ratio = 4.5
 bbox_right_ratio = 4.5
-bbox_top_ratio = 4
-bbox_down_ratio = 2
+bbox_top_ratio = 4.5
+bbox_down_ratio = 2.25
 
 def load_video(video_path):
     vidcap = cv2.VideoCapture(video_path)
@@ -84,7 +84,7 @@ def main():
 
     print(df_labels["contact"].sum(), len(df_labels))
 
-    df_tracking = pd.read_feather("../../output/preprocess/master_data_v3/gps.feather")
+    df_tracking = pd.read_feather("../../output/preprocess/master_data_v4/gps.feather")
     df_tracking["distance"] = [0 if ary[0] == "G" else ary[1] for ary in df_tracking[["nfl_player_id_2", "distance"]].values]
     df_dist = df_tracking.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])["distance"].min().reset_index()
     df_labels = pd.merge(df_labels, df_dist.query("distance < 1.5")[["game_play", "nfl_player_id_1", "nfl_player_id_2"]])
@@ -124,6 +124,7 @@ def main():
         gp = join_helmets_contact(game_play, df_labels, df_helmets, df_meta)
         for col in ["x", "y", "width", "height"]:
             gp[col] = gp[[f"{col}_1", f"{col}_2"]].mean(axis=1)
+        gp["bbox_size"] = gp[["width", "height"]].mean(axis=1)
         for view in ["Endzone", "Sideline"]:
             gp_ = gp[gp["view"] == view]
 
@@ -134,7 +135,7 @@ def main():
 
             bbox_dict = {}
             for key, w_df in gp_.drop_duplicates(["frame", "nfl_player_id_1"]).groupby("frame"):
-                bbox_dict[key] = w_df[["left_1", "width_1", "top_1", "height_1"]].dropna().values.astype(int)
+                bbox_dict[key] = w_df[["left_1", "width_1", "top_1", "height_1", "team_1"]].dropna().values
 
             frames = gp_["frame"].drop_duplicates().values
             video_path = f"{base_dir}/{traintest}/{game_play}_{view}.mp4"
@@ -147,22 +148,22 @@ def main():
                 if frame not in frames:
                     continue
 
-                img_filter = img_.copy()
                 for bbox in bbox_dict[frame]:
-                    box_left = bbox[0]
-                    box_right = bbox[0] + bbox[1]
-                    box_top = bbox[2]
-                    box_down = bbox[2] + bbox[3]
+                    box_left = int(bbox[0])
+                    box_right = int(bbox[0] + bbox[1])
+                    box_top = int(bbox[2])
+                    box_down = int(bbox[2] + bbox[3])
+                    if bbox[4] == "V":
+                        color = AWAY
+                    else:
+                        color = HOME
                     cv2.rectangle(
-                        img_filter,
+                        img_,
                         (box_left, box_top),
                         (box_right, box_down),
-                        PLAYER,
-                        thickness=-1,
+                        color,
+                        thickness=2,
                     )
-                img_[::96, :, :] = 0
-                img_[:, ::96, :] = 0
-                img_ = cv2.addWeighted(src1=img_, alpha=0.75, src2=img_filter, beta=0.25, gamma=0)
                 for key, w_df in data_dict.items():
                     img = img_.copy()
 
@@ -171,10 +172,10 @@ def main():
                     series = w_df.loc[frame]
                     if np.isnan(series["x"]):
                         continue
-                    left = int(series["x"] - series["width"] * bbox_left_ratio)
-                    right = int(series["x"] + series["width"] * bbox_right_ratio)
-                    top = int(series["y"] + series["height"] * bbox_top_ratio)
-                    down = int(series["y"] - series["height"] * bbox_down_ratio)
+                    left = int(series["x"] - series["bbox_size"] * bbox_left_ratio)
+                    right = int(series["x"] + series["bbox_size"] * bbox_right_ratio)
+                    top = int(series["y"] + series["bbox_size"] * bbox_top_ratio)
+                    down = int(series["y"] - series["bbox_size"] * bbox_down_ratio)
 
                     left = max(0, left)
                     down = max(0, down)
@@ -188,16 +189,9 @@ def main():
                             continue
 
                         if series[f"nfl_player_id_2"] == "G":
-                            box_color = CONTACT
-                        elif player_id == 1:
-                            box_color = HOME
-                        elif player_id == 2:
-                            if series["team_1"] != series["team_2"]:
-                                box_color = AWAY
-                            else:
-                                box_color = HOME
+                            box_color = G
                         else:
-                            raise ValueError
+                            box_color = CONTACT
                         box_left = max(0, int(series[f"left_{player_id}"]) - left)
                         box_right = max(min(img.shape[1], int(series[f"left_{player_id}"] + series[f"width_{player_id}"]) - left), 0)
                         box_top = max(0, int(series[f"top_{player_id}"]) - down)

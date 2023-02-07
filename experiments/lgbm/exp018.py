@@ -259,6 +259,10 @@ class LGBMModel:
             "distance_top3",
             "distance_top5",
             "distance_top7",
+            "diff_from_distance_top1",
+            "diff_from_distance_top3",
+            "diff_from_distance_top5",
+            "diff_from_distance_top7",
         ]
 
         # G精度向上のために player_1 のlag情報追加
@@ -280,6 +284,14 @@ class LGBMModel:
             df[lag_cols] = df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])[lag_columns].shift(lag)
             diff_cols = [f"{lag_column}_diff{lag}" for lag_column in lag_columns]
             df[diff_cols] = df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])[lag_columns].diff(lag)
+
+        for window in tqdm.tqdm([5, 15]):
+            rolling_cols = [f"{lag_column}_window{lag}_mean" for lag_column in lag_columns]
+            df[rolling_cols] = df.groupby(
+                ["game_play", "nfl_player_id_1", "nfl_player_id_2"]
+            )[lag_columns].rolling(window=window, center=True).mean().values
+            diff_cols = [f"{col}_diff{lag}" for col in rolling_cols]
+            df[diff_cols] = df[lag_columns].values - df[rolling_cols].values
 
         # 2nd groupby -> memory leakなったら面倒なので後で。。
         self.logger.info(f"groupby features 2nd: {df.shape}")
@@ -322,6 +334,10 @@ class LGBMModel:
             "distance_top3",
             "distance_top5",
             "distance_top7",
+            "diff_from_distance_top1",
+            "diff_from_distance_top3",
+            "diff_from_distance_top5",
+            "diff_from_distance_top7",
         ]
 
         agg_cols += player_features
@@ -342,6 +358,10 @@ class LGBMModel:
             "distance_top3",
             "distance_top5",
             "distance_top7",
+            "diff_from_distance_top1",
+            "diff_from_distance_top3",
+            "diff_from_distance_top5",
+            "diff_from_distance_top7",
         ]
 
         for agg_col in tqdm.tqdm(agg_col2):
@@ -374,10 +394,13 @@ class LGBMModel:
             "distance_top3",
             "distance_top5",
             "distance_top7",
+            "diff_from_distance_top1",
+            "diff_from_distance_top3",
+            "diff_from_distance_top5",
+            "diff_from_distance_top7",
         ]
         for groupby_col in ["is_g", "n_player_distance_all_in_3",
-                            "n_player_distance_sameteam_in_3", "n_player_distance_notsameteam_in_3",
-                            "n_player_distance_all_in_1", "n_player_distance_all_in_5", "n_player_distance_all_in_10"]:
+                            "n_player_distance_sameteam_in_3", "n_player_distance_notsameteam_in_3",]:
             for agg_col in tqdm.tqdm(agg_col3):
                 col_name = f"{agg_col}_groupby_{groupby_col}"
                 if not inference:
@@ -521,39 +544,36 @@ def main():
         'metrics': 'auc',
         'num_leaves': 128,
         'max_depth': -1,
-        'bagging_fraction': 0.7,  # 0.5,
+        'bagging_fraction': 0.9,  # 0.5,
         'feature_fraction': 0.3,
         'bagging_seed': 0,
-        'reg_alpha': 1,
+        'reg_alpha': 10,
         'reg_lambda': 5,
-        'min_data_in_leaf': 100,
+        'min_data_in_leaf': 10000,
         'random_state': 0,
         'verbosity': -1,
         "n_estimators": 20000,
         "early_stopping_rounds": 100,
         "learning_rate": 0.01,
-        "n_jobs": 32
+        "n_jobs": 28
     }
     # use_features = pd.read_csv("../../output/lgbm/exp013/20230122164447/feature_importance.csv")["col"].values[:400]
-    use_features = pd.read_csv(
-        "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
-    )["col"].values[:500]
 
     model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
-                      params=params, use_features=use_features)
+                      params=params)
     model.train(df)
     del model.logger
 
     with open(f"{output_dir}/model.pickle", "wb") as f:
         pickle.dump(model, f)
-    #
+
     # for _ in range(1000):
     #     output_dir = f"../../output/lgbm/{os.path.basename(__file__).replace('.py', '')}/{dt.now().strftime('%Y%m%d%H%M%S')}"
     #     os.makedirs(output_dir, exist_ok=True)
     #     shutil.copy(__file__, output_dir)
     #     logger = get_logger(output_dir)
     #
-    #     df = pd.read_feather("../../output/preprocess/master_data_v4/gps.feather")
+    #     df = pd.read_feather("../../output/preprocess/master_data_v3/gps.feather")
     #     if debug:
     #         df = df.head(300000)
     #
@@ -562,23 +582,20 @@ def main():
     #         'metrics': 'auc',
     #         'num_leaves': np.random.choice([16, 32, 64, 128, 256]),
     #         'max_depth': -1,
-    #         'bagging_fraction': np.random.choice([0.5, 0.7, 0.9]),  # 0.5,
-    #         'feature_fraction': np.random.choice([0.05, 0.1, 0.3, 0.5, 0.7]),
+    #         'bagging_fraction': np.random.choice([0.7, 0.9]),  # 0.5,
+    #         'feature_fraction': np.random.choice([0.1, 0.3, 0.5, 0.7, 0.9]),
     #         'bagging_seed': 0,
-    #         'reg_alpha': np.random.choice([0.5, 1, 3, 5, 10]),
-    #         'reg_lambda': np.random.choice([0.5, 1, 3, 5, 10]),
+    #         'reg_alpha': np.random.choice([0, 0.1, 0.5, 1, 3, 5, 10]),
+    #         'reg_lambda': np.random.choice([0, 0.1, 0.5, 1, 3, 5, 10]),
     #         'min_data_in_leaf': np.random.choice([1, 10, 50, 100, 500, 1000, 5000, 10000]),
     #         'random_state': 0,
     #         'verbosity': -1,
     #         "n_estimators": 20000,
     #         "early_stopping_rounds": 100,
     #         "learning_rate": 0.1,
-    #         "n_jobs": 32
+    #         "n_jobs": 8
     #     }
-    #     use_features = pd.read_csv(
-    #         "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
-    #     )["col"].values[:500]
-    #     model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp017", debug=debug, fast_mode=True,
+    #     model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
     #                       params=params, use_features=use_features)
     #     model.train(df)
 

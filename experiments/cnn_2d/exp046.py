@@ -104,7 +104,7 @@ class ConfigForTransformer:
         raise ValueError
     data_dir: str = f"../../output/preprocess/master_data_v3"
     base_dir: str = "../../output/preprocess/images"
-    image_path: str = "images_128x96_v10"
+    image_path: str = "a"
     model_name: str = "transformer"
     gradient_clipping: float = 10
     data_per_epoch: float = 1
@@ -125,6 +125,7 @@ class ConfigForTransformer:
     feature_dir: str = "../../output/preprocess/feature/exp017/feature_len13876756.feather"
     max_length: int = 256
     apply_log1p: bool = True
+    apply_norm: bool = False
     apply_ffn: bool = True
 
     use_features: List[str] = pd.read_csv(
@@ -136,6 +137,7 @@ class ConfigForTransformer:
     dropout_transformer: float = 0.1
     residual: bool = False
 
+    fold: int = 0
 
 @dataclasses.dataclass
 class Config:
@@ -159,7 +161,7 @@ class Config:
     negative_sample_ratio_far: float = 0.2
     negative_sample_ratio_g: float = 0.2
     base_dir: str = "../../output/preprocess/images"
-    image_path: str = "images_128x96_v10"
+    image_path: str = "images_128x96_v21"
     data_dir: str = f"../../output/preprocess/master_data_v3"
     img_shape: Tuple[int, int] = (96, 128)
     gradient_clipping: float = 0.2
@@ -182,7 +184,6 @@ class Config:
 
     distance_threshold: float = 1.75
     calc_single_view_loss: bool = True
-
     calc_single_view_loss_weight: float = 1
     exist_center_image_threshold: float = 0
 
@@ -201,6 +202,7 @@ class Config:
     kernel_size_3d: Tuple[int, int, int] = (7, 5, 5)
     stride_3d: Tuple[int, int, int] = (2, 1, 1)
     dilation_3d: Tuple[int, int, int] = (1, 1, 1)
+
     dropout_3d: float = 0.2
 
     transforms_train: A.Compose = A.Compose([
@@ -218,21 +220,28 @@ class Config:
     kernel_custom_3d: Tuple[int, int, int] = (2, 3, 3)
 
     feature_window: int = 0
-    feature_cols: Tuple[str] = ("distance", "speed_1", "speed_2")
+    feature_cols: List[str] = pd.read_csv(
+        "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
+    )["col"].values[:100]
     feature_hidden_size: int = 128
     feature_mean_dim: str = "window"
     nhead: int = 8
     num_layer_transformer: int = 2
+    feature_dir: str = "../../output/preprocess/feature/exp017/feature_len13876756.feather"
 
     save_feature: bool = True
     interpolate_outside: bool = True
     image_feature_dir: str = ""
 
     pretrained_feature_dim: int = 512
-    sep_is_g: bool = True
     channel_3d: int = 3
     seq_model_short: bool = False
+    only_g: bool = False
 
+    stack_dilations: Tuple[int] = (1, 2, 3, 4, 5)
+    pooling: str = "avgpool"
+
+    fold: int = 0
 
 class NFLDatasetForFeatureExtraction(Dataset):
     def __init__(self, base_dir):
@@ -315,6 +324,7 @@ class NFLTransformerDataset(Dataset):
 
             mask = np.ones(config.max_length)
             mask[:len(contacts_)] = 0
+            mask = mask == 1
 
             contacts = np.zeros(config.max_length)
             contacts[:len(contacts_)] = contacts_
@@ -422,7 +432,7 @@ class NFLDataset(Dataset):
                     filelist = pickle.load(f)
             else:
                 logger.info("make filelist...")
-                filelist = glob.glob(f"{self.base_dir}/*/*/*.jpg")
+                filelist = glob.glob(f"{self.base_dir}/*/*/*{self.config.extention}")
                 filelist = [f.replace("\\", "/") for f in filelist]
                 filelist = set(filelist)
                 logger.info("save filelist...")
@@ -433,13 +443,9 @@ class NFLDataset(Dataset):
 
         if not self.submission_mode:
             self.filelist = filelist
-        if self.config.model_name == "cnn_2d1d":
+        if self.config.model_name == "cnn_2d3d":
             logger.info("load features...")
-            self.image_dict = {key: value for key, value in zip(
-                np.load(f"{self.config.image_feature_dir}/files.npy"),
-                np.load(f"{self.config.image_feature_dir}/preds.npy")
-            )}
-            self.img_shape = list(self.image_dict.values())[0].shape
+            self.img_shape = np.load(list(filelist)[0]).shape
         elif "2.5d" not in self.config.model_name:
             self.img_shape = (self.config.img_shape[0], self.config.img_shape[1], 3)
         else:
@@ -507,6 +513,13 @@ class NFLDataset(Dataset):
         np.random.seed(0)
 
         contacts_all = []
+        df = df[df["contact"].notnull()]
+
+        if self.config.only_g:
+            df = df[df["nfl_player_id_2"] == "G"]
+        if self.config.feature_window > 0:
+            cols_log = [f"{col}_log" for col in self.config.feature_cols]
+            df[cols_log] = np.log1p(df[self.config.feature_cols].fillna(0)).replace(np.inf, 0).replace(-np.inf, 0).fillna(0)
         for key, w_df in tqdm.tqdm(
             df.drop_duplicates(
                 ["game_play", "nfl_player_id_1", "nfl_player_id_2", "step"]
@@ -525,7 +538,7 @@ class NFLDataset(Dataset):
             distances = w_df["distance"].fillna(0).values
 
             if self.config.feature_window > 0:
-                features = np.log1p(w_df[list(self.config.feature_cols)].fillna(0).values)
+                features = w_df[cols_log].values
 
             for i in range(len(w_df)):
 
@@ -550,8 +563,8 @@ class NFLDataset(Dataset):
                     i + window + 1,
                 )
 
-                if config.feature_window > 0:
-                    feature_window = config.feature_window // 2
+                if self.config.feature_window > 0:
+                    feature_window = self.config.feature_window // 2
                     feature_indices = np.arange(
                         max(i - feature_window, 0),
                         min(i + feature_window + 1, len(w_df))
@@ -568,7 +581,7 @@ class NFLDataset(Dataset):
                             feature,
                             np.zeros((feature_window + i + 1 - len(w_df), len(self.config.feature_cols))) - 1
                         ], axis=0)
-                    assert feature.shape == (config.feature_window, len(self.config.feature_cols))
+                    assert feature.shape == (self.config.feature_window, len(self.config.feature_cols))
                 else:
                     feature = [0]
 
@@ -945,22 +958,19 @@ def save_feature(model, device: str, config: Config):
 
     with torch.no_grad():
         for bi, data in tk0:
-            batch_size = len(data)
-
             x = data[0].to(device)
             file = data[1]
 
+            file = np.array(file).flatten().tolist()
             with torch.cuda.amp.autocast():
                 pred_2d = model.forward_features(x)
-                pred = F.adaptive_avg_pool2d(pred_2d, 1).squeeze(3).squeeze(2)
-                # preds_2d.append(pred_2d.detach().cpu().numpy().astype(np.float16))
-                preds.append(pred.detach().cpu().numpy().astype(np.float16))
+                pred_2d = pred_2d.detach().cpu().numpy().astype(np.float16)
+            for i in range(len(file)):
+                f_structure = file[i].split("/")[-3:]
+                output_dir = f"{config.output_dir}/2d/" + "/".join(f_structure[:-1])
+                os.makedirs(output_dir, exist_ok=True)
 
-            files.extend([get_key(f) for f in np.array(file).flatten()])
-
-    np.save(f"{config.output_dir}/preds.npy", np.concatenate(preds).astype(np.float16))
-    # np.save(f"{config.output_dir}/preds_2d.npy", np.concatenate(preds_2d).astype(np.float16))
-    np.save(f"{config.output_dir}/files.npy", np.array(files))
+                np.save(f"{output_dir}/{f_structure[-1].replace('.jpg', '.npy')}", pred_2d[i])
 
 class FFN(nn.Module):
     def __init__(self, state_size=200):
@@ -989,7 +999,7 @@ class TransformerModel(nn.Module):
         self.config = config
         self.fc1 = nn.LazyLinear(self.config.hidden_size_transformer)
         self.ln1 = nn.LayerNorm(self.config.hidden_size_transformer)
-        self.bn = nn.BatchNorm1d(self.config.hidden_size_transformer)
+        self.bn = nn.BatchNorm1d(self.config.max_length)
 
         if self.config.transformer == "only_encoder":
             transformer_encoder = nn.TransformerEncoderLayer(
@@ -1025,12 +1035,16 @@ class TransformerModel(nn.Module):
         self.fc = nn.LazyLinear(1)
 
     def forward(self, x, mask, is_g):
+        if self.config.apply_norm:
+            x = self.bn(x)
         x = self.fc1(x)
         x_feat = self.ln1(x)
+        mask_ = (mask[:, None, :] * mask[:, :, None])
+        mask_ = torch.cat([m[np.newaxis].tile(self.config.nhead, 1, 1) for m in mask_], dim=0)
         if self.config.transformer == "only_encoder":
-            x = self.transformer(x_feat)  # (bs, seq_len, n_feature) -> (bs, seq_len, n_feature)
+            x = self.transformer(x_feat, mask_)  # (bs, seq_len, n_feature) -> (bs, seq_len, n_feature)
         elif self.config.transformer == "transformer":
-            x = self.transformer(x_feat, x_feat)  # (bs, seq_len, n_feature) -> (bs, seq_len, n_feature)
+            x = self.transformer(x_feat, x_feat, mask_, mask_)  # (bs, seq_len, n_feature) -> (bs, seq_len, n_feature)
 
         x = self.rnn(x)[0]  # (bs, seq_len, n_feature) -> (bs, seq_len, n_feature)
         x = self.layer_norm(x)
@@ -1100,6 +1114,40 @@ class SimpleConv3d(nn.Module):
         return x
 
 
+class StackConv3d(nn.Module):
+    def __init__(self,
+                 config: Config):
+        super(StackConv3d, self).__init__()
+        hid = config.hidden_size_3d
+
+        models = []
+
+        for dilation in config.stack_dilations:
+            models.append(nn.Sequential(
+                nn.LazyConv3d(hid,
+                              (config.kernel_size_3d[0] // dilation, config.kernel_size_3d[1], config.kernel_size_3d[2]),
+                              bias=False,
+                              stride=(max(config.stride_3d[0] // dilation, 1), config.stride_3d[1], config.stride_3d[2]),
+                              padding=(0, 1, 1),
+                              dilation=(dilation, 1, 1)),
+                nn.BatchNorm3d(hid),
+                nn.Dropout(config.dropout_3d),
+            ))
+        self.models = nn.ModuleList(models)
+        self.num_features = hid
+        self.activation = config.activation()
+
+    def forward(self, x):
+
+        rets = []
+        for model in self.models:
+            ret = self.activation(model(x))
+            ret = F.adaptive_avg_pool3d(ret, 1).squeeze(4).squeeze(3).squeeze(2)
+            rets.append(ret)
+        rets = torch.cat(rets, dim=1)
+        return rets
+
+
 class SlowFastConv3d(nn.Module):
     def __init__(self,
                  config: Config):
@@ -1132,21 +1180,22 @@ class ThreeLayerConv3d(nn.Module):
                  config: Config):
         super(ThreeLayerConv3d, self).__init__()
         hid = config.hidden_size_3d
-        self.fc = nn.LazyConv3d(hid, (13, 2, 2), bias=False, stride=(3, 1, 1), padding=(0, 1, 1))
+        self.fc = nn.LazyConv3d(hid, config.kernel_size_3d, bias=False, stride=config.stride_3d, padding=(0, 1, 1))
         self.bn = nn.BatchNorm3d(hid)
         self.do = nn.Dropout(0.2)
-        self.fc2 = nn.LazyConv3d(hid*2, (7, 1, 1), bias=False, stride=(2, 1, 1))
+        self.pool = nn.MaxPool3d((3, 1, 1))
+        self.fc2 = nn.LazyConv3d(hid*2, (3, 1, 1), bias=False, stride=(2, 1, 1))
         self.bn2 = nn.BatchNorm3d(hid*2)
         self.do2 = nn.Dropout(0.25)
-        self.fc3 = nn.LazyConv3d(hid*4, (5, 1, 1), bias=False, stride=(2, 1, 1))
-        self.bn3 = nn.BatchNorm3d(hid*4)
+        self.fc3 = nn.LazyConv3d(hid*2, (2, 1, 1), bias=False, stride=(1, 1, 1))
+        self.bn3 = nn.BatchNorm3d(hid*2)
         self.do3 = nn.Dropout(0.25)
         self.num_features = hid
 
     def forward(self, x):
-        x = self.do(F.gelu(self.bn(self.fc(x))))
-        x = self.do2(F.gelu(self.bn2(self.fc2(x))))
-        x = self.do3(F.gelu(self.bn3(self.fc3(x))))
+        x = self.pool(self.do(F.relu(self.bn(self.fc(x)))))
+        x = self.do2(F.relu(self.bn2(self.fc2(x))))
+        x = self.do3(F.relu(self.bn3(self.fc3(x))))
         return x
 
 
@@ -1155,11 +1204,11 @@ class TwoLayerConv3d(nn.Module):
                  config: Config):
         super(TwoLayerConv3d, self).__init__()
         hid = config.hidden_size_3d
-        self.fc = nn.LazyConv3d(hid, (5, 2, 2), bias=False, stride=(3, 1, 1), padding=(0, 1, 1))
+        self.fc = nn.LazyConv3d(hid, config.kernel_size_3d[0], bias=False, stride= config.stride_3d[0], padding=(0, 1, 1))
         self.bn = nn.BatchNorm3d(hid)
         self.do = nn.Dropout(0.2)
         self.pool = nn.MaxPool3d((3, 1, 1))
-        self.fc2 = nn.LazyConv3d(hid*2, (3, 2, 2), bias=False, stride=(2, 1, 1))
+        self.fc2 = nn.LazyConv3d(hid*2, config.kernel_size_3d[1], bias=False, stride=config.stride_3d[1])
         self.bn2 = nn.BatchNorm3d(hid*2)
         self.do2 = nn.Dropout(0.25)
         self.activation = config.activation()
@@ -1244,6 +1293,8 @@ class SequenceModel(nn.Module):
             self.model = ThreeLayerConv1DUnit(config)
         elif config.seq_model =="3dcnn_simple":
             self.model = SimpleConv3d(config=config)
+        elif config.seq_model == "3dcnn_stack":
+            self.model = StackConv3d(config=config)
         elif config.seq_model == "3dcnn_2layers":
             self.model = TwoLayerConv3d(config=config)
         elif config.seq_model == "3dcnn_3layers":
@@ -1281,12 +1332,20 @@ class Model2DTo1D(nn.Module):
                 nn.Linear(32, config.n_predict_frames)
             )
         self.fc_weight = nn.LazyLinear(1)
-        if self.config.sep_is_g:
-            self.fc_contact = nn.LazyLinear(config.n_predict_frames)
-            self.fc_g = nn.LazyLinear(config.n_predict_frames)
-        if self.config.calc_single_view_loss:
-            self.fc_endzone = nn.LazyLinear(config.n_predict_frames)
-            self.fc_sideline = nn.LazyLinear(config.n_predict_frames)
+        self.fc_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_g = nn.LazyLinear(config.n_predict_frames)
+        self.fc_endzone_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_sideline_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_endzone_g = nn.LazyLinear(config.n_predict_frames)
+        self.fc_sideline_g = nn.LazyLinear(config.n_predict_frames)
+
+    def _forward_g_contact(self, model_g, model_contact, x, is_g):
+        x_contact = model_contact(x)  # (bs, n_predict_frames)
+        x_g = model_g(x)  # (bs, n_predict_frames)
+
+        not_is_g = (is_g == 0)
+        x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
+        return x
 
     def forward(self, x, is_g, feature):
         if "cnn_2d_" in self.config.model_name:
@@ -1300,23 +1359,83 @@ class Model2DTo1D(nn.Module):
         x = x.reshape(bs*2, seq_len//2, f_dim)  # shape = (bs*n_view, seq_len, features)
 
         x = self.seq_model(x) # (bs*n_view, seq_len, features) -> (bs*n_view, hidden)
-        x = F.adaptive_avg_pool1d(x, 1).squeeze(2)
+        if self.config.pooling == "avgpool":
+            x = F.adaptive_avg_pool1d(x, 1).squeeze(2)
+        elif self.config.pooling == "maxpool":
+            x = F.adaptive_max_pool1d(x, 1).squeeze(2)
 
-        x_endzone = None
-        x_sideline = None
-        if self.config.calc_single_view_loss:
-            x_endzone = self.fc_endzone(x[::2])
-            x_sideline = self.fc_sideline(x[1::2])
+        x_endzone = self._forward_g_contact(self.fc_endzone_g, self.fc_endzone_contact, x[::2], is_g)
+        x_sideline = self._forward_g_contact(self.fc_sideline_g, self.fc_sideline_contact, x[1::2], is_g)
         if self.config.fc_sideend == "concat":
             x = x.reshape(bs, -1)
-            if self.config.sep_is_g:
-                x_contact = self.fc_contact(x)  # (bs, n_predict_frames)
-                x_g = self.fc_g(x)  # (bs, n_predict_frames)
+            x = self._forward_g_contact(self.fc_g, self.fc_contact, x, is_g)
+        return x, x_endzone, x_sideline
 
-                not_is_g = (is_g == 0)
-                x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
-            else:
-                x = self.fc(x)
+    def forward_features(self, x):
+        return self.cnn_2d.forward_features(x)
+
+
+class Model2DTo3D(nn.Module):
+    def __init__(self,
+                 config: Config):
+        super().__init__()
+        self.config = config
+        if "cnn_2d_" in self.config.model_name:
+            self.cnn_2d = timm.create_model(config.model_name.replace("cnn_2d_", ""), num_classes=0, pretrained=True)
+
+        self.seq_model = SequenceModel(
+            hidden_size=self.config.pretrained_feature_dim,
+            config=config
+        )
+        if self.config.fc == "simple":
+            self.fc = nn.LazyLinear(config.n_predict_frames)
+        elif self.config.fc == "2layer":
+            self.fc = nn.Sequential(
+                nn.LazyLinear(32),
+                nn.Dropout(self.config.fc_dropout),
+                nn.GELU(),
+                nn.Linear(32, config.n_predict_frames)
+            )
+        self.fc_weight = nn.LazyLinear(1)
+        self.fc_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_g = nn.LazyLinear(config.n_predict_frames)
+        self.fc_endzone_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_sideline_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_endzone_g = nn.LazyLinear(config.n_predict_frames)
+        self.fc_sideline_g = nn.LazyLinear(config.n_predict_frames)
+
+    def _forward_g_contact(self, model_g, model_contact, x, is_g):
+        x_contact = model_contact(x)  # (bs, n_predict_frames)
+        x_g = model_g(x)  # (bs, n_predict_frames)
+
+        not_is_g = (is_g == 0)
+        x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
+        return x
+
+    def forward(self, x, is_g, feature):
+        if "cnn_2d_" in self.config.model_name:
+            bs, C, seq_len, W, H = x.shape
+            x = x.permute(0, 2, 1, 3, 4)  # (bs, seq_len*n_view, C, W, H)
+            x = x.reshape(bs * seq_len, C, W, H)  # (bs*seq_len*n_view, C, W, H)
+            x = self.cnn_2d.forward_features(x)  # (bs, n_view*seq_len, C, W, H)
+            x = x.reshape(bs, -1, x.shape[1], x.shape[2], x.shape[3])
+            x = x.permute(0, 2, 1, 3, 4)
+
+        bs, C, seq_len, W, H = x.shape
+        x = x.permute(0, 2, 1, 3, 4)  # (bs, n_view*seq_len, C, W, H)
+        x = x.reshape(bs*2, seq_len//2, C, W, H)   # (bs*n_view, seq_len, C, W, H)
+        x = x.permute(0, 2, 1, 3, 4)
+
+        x = self.seq_model(x)  # (bs*n_view, seq_len, features) -> (bs*n_view, hidden)
+
+        if len(x.shape) == 5:
+            x = F.adaptive_avg_pool3d(x, 1).squeeze(4).squeeze(3).squeeze(2)
+
+        x_endzone = self._forward_g_contact(self.fc_endzone_g, self.fc_endzone_contact, x[::2], is_g)
+        x_sideline = self._forward_g_contact(self.fc_sideline_g, self.fc_sideline_contact, x[1::2], is_g)
+        if self.config.fc_sideend == "concat":
+            x = x.reshape(bs, -1)
+            x = self._forward_g_contact(self.fc_g, self.fc_contact, x, is_g)
         return x, x_endzone, x_sideline
 
     def forward_features(self, x):
@@ -1346,13 +1465,20 @@ class Model2D(nn.Module):
                 nn.GELU(),
                 nn.Linear(32, config.n_predict_frames)
             )
-        self.fc_weight = nn.LazyLinear(1)
-        if self.config.sep_is_g:
-            self.fc_contact = nn.LazyLinear(config.n_predict_frames)
-            self.fc_g = nn.LazyLinear(config.n_predict_frames)
-        if self.config.calc_single_view_loss:
-            self.fc_endzone = nn.LazyLinear(config.n_predict_frames)
-            self.fc_sideline = nn.LazyLinear(config.n_predict_frames)
+        self.fc_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_g = nn.LazyLinear(config.n_predict_frames)
+        self.fc_endzone_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_sideline_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_endzone_g = nn.LazyLinear(config.n_predict_frames)
+        self.fc_sideline_g = nn.LazyLinear(config.n_predict_frames)
+
+    def _forward_g_contact(self, model_g, model_contact, x, is_g):
+        x_contact = model_contact(x)  # (bs, n_predict_frames)
+        x_g = model_g(x)  # (bs, n_predict_frames)
+
+        not_is_g = (is_g == 0)
+        x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
+        return x
 
     def forward(self, x, is_g, feature):
         bs, C, seq_len, W, H = x.shape  # seq_len = 1
@@ -1362,18 +1488,10 @@ class Model2D(nn.Module):
         x_endzone = None
         x_sideline = None
         x = self.cnn_2d(x)  # (bs*n_view, features)
-        if self.config.calc_single_view_loss:
-            x_endzone = self.fc_endzone(x[::2])
-            x_sideline = self.fc_sideline(x[1::2])
+        x_endzone = self._forward_g_contact(self.fc_endzone_g, self.fc_endzone_contact, x[::2], is_g)
+        x_sideline = self._forward_g_contact(self.fc_sideline_g, self.fc_sideline_contact, x[1::2], is_g)
         x = torch.cat([x[::2], x[1::2]], dim=1)  # (bs, n_view*features)
-        if self.config.sep_is_g:
-            x_contact = self.fc_contact(x)  # (bs, n_predict_frames)
-            x_g = self.fc_g(x)  # (bs, n_predict_frames)
-
-            not_is_g = (is_g == 0)
-            x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
-        else:
-            x = self.fc(x)  # (bs, seq_len, n_predict_frames)
+        x = self._forward_g_contact(self.fc_g, self.fc_contact, x, is_g)
 
         return x, x_endzone, x_sideline
 
@@ -1439,27 +1557,14 @@ class Model2p5DTo3D(nn.Module):
             config_.stride_3d = (config.stride_3d[0]//2, 1, 1)
             self.seq_model_short = SimpleConv3d(config=config_)
 
-        if self.config.sep_is_g:
-            if self.config.fc == "2layer":
-                raise NotImplementedError
-            if self.config.fc_sideend != "concat":
-                raise NotImplementedError
-            self.fc_contact = nn.LazyLinear(config.n_predict_frames)
-            self.fc_g = nn.LazyLinear(config.n_predict_frames)
-        else:
-            if self.config.fc == "simple":
-                self.fc = nn.LazyLinear(config.n_predict_frames)
-            elif self.config.fc == "2layer":
-                self.fc = nn.Sequential(
-                    nn.LazyLinear(32),
-                    nn.Dropout(self.config.fc_dropout),
-                    nn.GELU(),
-                    nn.Linear(32, config.n_predict_frames)
-                )
+        self.fc_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_g = nn.LazyLinear(config.n_predict_frames)
+
         self.fc_weight = nn.LazyLinear(1)
-        if self.config.calc_single_view_loss:
-            self.fc_endzone = nn.LazyLinear(config.n_predict_frames)
-            self.fc_sideline = nn.LazyLinear(config.n_predict_frames)
+        self.fc_endzone_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_sideline_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_endzone_g = nn.LazyLinear(config.n_predict_frames)
+        self.fc_sideline_g = nn.LazyLinear(config.n_predict_frames)
         if self.config.g_embedding:
             self.emb_g = nn.Embedding(2, 16)
         if self.config.feature_window > 0:
@@ -1474,6 +1579,15 @@ class Model2p5DTo3D(nn.Module):
                 encoder_layer=transformer_encoder,
                 # norm=nn.LayerNorm(self.config.num_layer_transformer),
             )
+            self.ln = nn.LayerNorm(self.config.feature_hidden_size)
+
+    def _forward_g_contact(self, model_g, model_contact, x, is_g):
+        x_contact = model_contact(x)  # (bs, n_predict_frames)
+        x_g = model_g(x)  # (bs, n_predict_frames)
+
+        not_is_g = (is_g == 0)
+        x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
+        return x
 
     def forward(self, x, is_g, feature):
         bs, _, seq_len, W, H = x.shape  # C = 1
@@ -1488,6 +1602,7 @@ class Model2p5DTo3D(nn.Module):
         if self.config.feature_window > 0:
             feature = self.fc_feature(feature)  # (bs, feature_window, feature_hidden_size)
             feature = self.transformer(feature)  # (bs, feature_window, feature_hidden_size)
+            feature = self.ln(feature)
 
             if self.config.feature_mean_dim == "feature":
                 feature = feature.mean(dim=2)  # (bs, feature_window)
@@ -1495,16 +1610,27 @@ class Model2p5DTo3D(nn.Module):
                 feature = feature.mean(dim=1)  # (bs, feature_hidden_size)
 
         if self.config.seq_model == "3dcnn_slowfast":
-            x_slow = F.adaptive_avg_pool3d(x[0], 1).squeeze(4).squeeze(3).squeeze(2)
-            x_fast = F.adaptive_avg_pool3d(x[1], 1).squeeze(4).squeeze(3).squeeze(2)
+            if self.config.pooling == "avgpool":
+                x_slow = F.adaptive_avg_pool3d(x[0], 1).squeeze(4).squeeze(3).squeeze(2)
+                x_fast = F.adaptive_avg_pool3d(x[1], 1).squeeze(4).squeeze(3).squeeze(2)
+            elif self.config.pooling == "maxpool":
+                x_slow = F.adaptive_max_pool3d(x[0], 1).squeeze(4).squeeze(3).squeeze(2)
+                x_fast = F.adaptive_max_pool3d(x[1], 1).squeeze(4).squeeze(3).squeeze(2)
             x = torch.cat([x_slow, x_fast], dim=1)
 
         elif self.config.seq_model == "3dcnn_slowfast_add":
-            x_slow = F.adaptive_avg_pool3d(x[0], 1).squeeze(4).squeeze(3).squeeze(2)
-            x_fast = F.adaptive_avg_pool3d(x[1], 1).squeeze(4).squeeze(3).squeeze(2)
+            if self.config.pooling == "avgpool":
+                x_slow = F.adaptive_avg_pool3d(x[0], 1).squeeze(4).squeeze(3).squeeze(2)
+                x_fast = F.adaptive_avg_pool3d(x[1], 1).squeeze(4).squeeze(3).squeeze(2)
+            elif self.config.pooling == "maxpool":
+                x_slow = F.adaptive_max_pool3d(x[0], 1).squeeze(4).squeeze(3).squeeze(2)
+                x_fast = F.adaptive_max_pool3d(x[1], 1).squeeze(4).squeeze(3).squeeze(2)
             x = x_slow + x_fast
         else:
-            x = F.adaptive_avg_pool3d(x, 1).squeeze(4).squeeze(3).squeeze(2)
+            if self.config.pooling == "avgpool":
+                x = F.adaptive_avg_pool3d(x, 1).squeeze(4).squeeze(3).squeeze(2)
+            elif self.config.pooling == "maxpool":
+                x = F.adaptive_max_pool3d(x, 1).squeeze(4).squeeze(3).squeeze(2)
         if self.config.seq_model_short:
             center_min = (seq_len // (self.config.channel_3d * 2)) // 4
             center_max = (seq_len // (self.config.channel_3d * 2) * 3) // 4
@@ -1512,11 +1638,8 @@ class Model2p5DTo3D(nn.Module):
             x_short = F.adaptive_avg_pool3d(x_short, 1).squeeze(4).squeeze(3).squeeze(2)
             x = torch.cat([x, x_short], dim=1)
 
-        x_endzone = None
-        x_sideline = None
-        if self.config.calc_single_view_loss:
-            x_endzone = self.fc_endzone(x[::2])
-            x_sideline = self.fc_sideline(x[1::2])
+        x_endzone = self._forward_g_contact(self.fc_endzone_g, self.fc_endzone_contact, x[::2], is_g)
+        x_sideline = self._forward_g_contact(self.fc_sideline_g, self.fc_sideline_contact, x[1::2], is_g)
 
         if self.config.fc_sideend == "add_weight":
             weight_end = torch.sigmoid(self.fc_weight(x[::2]))
@@ -1531,14 +1654,7 @@ class Model2p5DTo3D(nn.Module):
                 x = torch.cat([x, x_emb_g], dim=1)
             if self.config.feature_window > 0:
                 x = torch.cat([x, feature], dim=1)
-            if self.config.sep_is_g:
-                x_contact = self.fc_contact(x)  # (bs, n_predict_frames)
-                x_g = self.fc_g(x)  # (bs, n_predict_frames)
-
-                not_is_g = (is_g == 0)
-                x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
-            else:
-                x = self.fc(x)
+            x = self._forward_g_contact(self.fc_g, self.fc_contact, x, is_g)
         return x, x_endzone, x_sideline
 
 
@@ -1570,27 +1686,12 @@ class Model3D(nn.Module):
                 weights = MC3_18_Weights.DEFAULT
                 self.model = mc3_18(weights=weights)
                 self.model.fc = nn.Identity()
-        if self.config.calc_single_view_loss:
-            self.fc_endzone = nn.LazyLinear(config.n_predict_frames)
-            self.fc_sideline = nn.LazyLinear(config.n_predict_frames)
-
-        if self.config.sep_is_g:
-            if self.config.fc == "2layer":
-                raise NotImplementedError
-            if self.config.fc_sideend != "concat":
-                raise NotImplementedError
-            self.fc_contact = nn.LazyLinear(config.n_predict_frames)
-            self.fc_g = nn.LazyLinear(config.n_predict_frames)
-        else:
-            if self.config.fc == "simple":
-                self.fc = nn.LazyLinear(config.n_predict_frames)
-            elif self.config.fc == "2layer":
-                self.fc = nn.Sequential(
-                    nn.LazyLinear(32),
-                    nn.Dropout(self.config.fc_dropout),
-                    nn.GELU(),
-                    nn.Linear(32, config.n_predict_frames)
-                )
+        self.fc_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_g = nn.LazyLinear(config.n_predict_frames)
+        self.fc_endzone_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_sideline_contact = nn.LazyLinear(config.n_predict_frames)
+        self.fc_endzone_g = nn.LazyLinear(config.n_predict_frames)
+        self.fc_sideline_g = nn.LazyLinear(config.n_predict_frames)
 
         if self.config.fc_sideend == "add_weight":
             self.fc_weight = nn.LazyLinear(1)
@@ -1608,6 +1709,15 @@ class Model3D(nn.Module):
                 encoder_layer=transformer_encoder,
                 # norm=nn.LayerNorm(self.config.num_layer_transformer),
             )
+            self.ln = nn.LayerNorm(self.config.feature_hidden_size)
+
+    def _forward_g_contact(self, model_g, model_contact, x, is_g):
+        x_contact = model_contact(x)  # (bs, n_predict_frames)
+        x_g = model_g(x)  # (bs, n_predict_frames)
+
+        not_is_g = (is_g == 0)
+        x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
+        return x
 
     def forward(self, x, is_g, feature):
         bs, C, seq_len, W, H = x.shape
@@ -1621,17 +1731,15 @@ class Model3D(nn.Module):
         if self.config.feature_window > 0:
             feature = self.fc_feature(feature)  # (bs, feature_window, feature_hidden_size)
             feature = self.transformer(feature)  # (bs, feature_window, feature_hidden_size)
+            feature = self.ln(feature)
 
             if self.config.feature_mean_dim == "feature":
                 feature = feature.mean(dim=2)  # (bs, feature_window)
             elif self.config.feature_mean_dim == "window":
                 feature = feature.mean(dim=1)  # (bs, feature_hidden_size)
 
-        x_endzone = None
-        x_sideline = None
-        if self.config.calc_single_view_loss:
-            x_endzone = self.fc_endzone(x[::2])
-            x_sideline = self.fc_sideline(x[1::2])
+        x_endzone = self._forward_g_contact(self.fc_endzone_g, self.fc_endzone_contact, x[::2], is_g)
+        x_sideline = self._forward_g_contact(self.fc_sideline_g, self.fc_sideline_contact, x[1::2], is_g)
         if self.config.fc_sideend == "add":
             x = x[::2] + x[1::2]
             x = self.fc(x)
@@ -1650,14 +1758,7 @@ class Model3D(nn.Module):
                 x = torch.cat([x, x_emb_g], dim=1)
             if self.config.feature_window > 0:
                 x = torch.cat([x, feature], dim=1)
-            if self.config.sep_is_g:
-                x_contact = self.fc_contact(x)  # (bs, n_predict_frames)
-                x_g = self.fc_g(x)  # (bs, n_predict_frames)
-
-                not_is_g = (is_g == 0)
-                x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
-            else:
-                x = self.fc(x)
+            x = self._forward_g_contact(self.fc_g, self.fc_contact, x, is_g)
 
         return x, x_endzone, x_sideline
 
@@ -1727,13 +1828,7 @@ def main(config):
         base_dir = config.base_dir
         logger = get_logger(output_dir)
         logger.info("start!")
-        df = pd.read_feather(
-            f"{config.data_dir}/gps.feather",
-            columns=[
-                "contact_id", "game_play", "step", "nfl_player_id_1", "nfl_player_id_2", "contact", "frame", "view", "distance",
-                "game_key", "speed_1", "speed_2", "distance_1", "acceleration_1", "team_1", "team_2"
-            ]
-        )
+        df = pd.read_feather(config.feature_dir)
         gkfold = GroupKFold(5)
 
         df_label = pd.read_csv("../../input/nfl-player-contact-detection/train_labels.csv")
@@ -1751,8 +1846,10 @@ def main(config):
             model = Model2p5D(config=config)
         elif "cnn_2d_" in config.model_name and config.n_frames == 1:
             model = Model2D(config=config)
-        elif config.model_name == "cnn_2d1d" or "cnn_2d_" in config.model_name:
+        elif (config.model_name == "cnn_2d1d") or ("cnn_2d_" in config.model_name  and "1dcnn_" in config.seq_model):
             model = Model2DTo1D(config=config)
+        elif (config.model_name == "cnn_2d3d") or ("cnn_2d_" in config.model_name and "3dcnn_" in config.seq_model):
+            model = Model2DTo3D(config=config)
         elif type(config) == ConfigForGNN:
             model = NFLGraphModel(config=config)
         elif type(config) == ConfigForTransformer:
@@ -1761,7 +1858,9 @@ def main(config):
             raise ValueError
 
         df_label["game_key"] = [int(x.split("_")[0]) for x in df_label["contact_id"].values]
-        for train_idx, val_idx in gkfold.split(df_label, groups=df_label["game_key"].values):
+        for fold, (train_idx, val_idx) in enumerate(gkfold.split(df_label, groups=df_label["game_key"].values)):
+            if fold != config.fold:
+                continue
             df_label_train = df_label.iloc[train_idx]
             df_label_val = df_label.iloc[val_idx]
             if type(config) == ConfigForTransformer:
@@ -1897,8 +1996,10 @@ def main(config):
         model = model.to(device)
         def get_params(k, params):
             if k in ["cnn_2d", "model"]:
+                logger.info(f"{k}: lr={config.lr}")
                 return {"params": params.parameters(), "lr": config.lr, "weight_decay": config.weight_decay}
             else:
+                logger.info(f"{k}: lr={config.lr_fc}")
                 return {"params": params.parameters(), "lr": config.lr_fc, "weight_decay": config.weight_decay}
         params = [get_params(k, params) for k, params in model._modules.items()]
         optimizer = torch.optim.AdamW(params)
@@ -1944,7 +2045,7 @@ def main(config):
             "MCC_extracted": possible_score_extracted,
         })
         wandb.config.update({"output_dir": output_dir})
-        total_best_score = -1
+        total_best_score = {}
         for epoch in range(config.epochs):
             logger.info(f"===============================")
             logger.info(f"epoch {epoch + 1}")
@@ -1991,75 +2092,101 @@ def main(config):
 
             df_label = pd.read_csv("../../input/nfl-player-contact-detection/train_labels.csv")
             df_label["game_key"] = [int(x.split("_")[0]) for x in df_label["contact_id"].values]
-            for train_idx, val_idx in gkfold.split(df_label, groups=df_label["game_key"].values):
+            for fold, (train_idx, val_idx) in enumerate(gkfold.split(df_label, groups=df_label["game_key"].values)):
+                if fold != config.fold:
+                    continue
                 df_label_val = df_label.iloc[val_idx]
                 break
 
             logger.info(f"loss: train {train_loss}, val {valid_loss}")
             logger.info(f"------ MCC ------")
+
+            if config.calc_single_view_loss:
+                cols = ["score_endzone", "score_sideline", "score"]
+            else:
+                cols = ["score"]
             if type(config) == ConfigForTransformer:
                 if len(df_label_val) != len(df_pred):
                     logger.info("df length が違う")
                 df_score = df_pred.copy()
                 df_score["contact"] = df_score["label"]
-
             else:
                 df_merge = pd.merge(df_label_val, df_pred, how="left")
-                df_score = df_merge.groupby(["contact_id", "contact"], as_index=False)["score"].apply(np.mean)
-            logger.info(f"\n[G]")
-            w_df = df_score[df_score["contact_id"].str.contains("G")]
-            label_g = w_df["contact"].values
-            pred_g = w_df["score"].fillna(0).values
-            _, best_th_g, best_score_g = calc_best(label_g, pred_g, logger, epoch, name="g")
-
-            logger.info(f"\n[Contact]")
-            w_df = df_score[~df_score["contact_id"].str.contains("G")]
-            label_contact = w_df["contact"].values
-            pred_contact = w_df["score"].fillna(0).values
-            _, best_th_contact, best_score_contact = calc_best(label_contact, pred_contact, logger, epoch, name="contact")
-
-            best_score = matthews_corrcoef(
-                np.concatenate([label_g, label_contact]),
-                np.concatenate([pred_g > best_th_g, pred_contact > best_th_contact]),
-            )
-
-            logger.info(f"***************** epoch {epoch} *****************")
-            logger.info(f"best: {best_score}")
-            logger.info(f"******************************************")
-            if type(config) == ConfigForTransformer:
-                df_pred.to_csv(f"{output_dir}/pred_{epoch}.csv", index=False)
-            else:
-                pd.merge(df_label_val, df_pred, how="left").to_csv(f"{output_dir}/pred_{epoch}.csv", index=False)
-            if not config.debug:
-                torch.save(model.state_dict(), f"{output_dir}/epoch{epoch}.pth")
+                df_score = df_merge.groupby(["contact_id", "contact"], as_index=False)[cols].mean()
 
             results.append({
                 "epoch": epoch,
-                "score": best_score,
                 "train_loss": train_loss,
                 "val_loss": valid_loss,
             })
+
             wandb.log({
                 "val_loss": valid_loss,
-                "score": best_score,
-                "score_g": best_score_g,
-                "score_contact": best_score_contact,
                 "epoch": epoch,
             })
-            if total_best_score < best_score:
-                total_best_score = best_score
+
+            for col in cols:
+                logger.info(f"-------------- {col} ----------------")
+                logger.info(f"\n[G]")
+                w_df = df_score[df_score["contact_id"].str.contains("G")]
+                label_g = w_df["contact"].values
+                pred_g = w_df[col].fillna(0).values
+                _, best_th_g, best_score_g = calc_best(label_g, pred_g, logger, epoch, name="g")
+
+                logger.info(f"\n[Contact]")
+                w_df = df_score[~df_score["contact_id"].str.contains("G")]
+                label_contact = w_df["contact"].values
+                pred_contact = w_df[col].fillna(0).values
+                _, best_th_contact, best_score_contact = calc_best(label_contact, pred_contact, logger, epoch, name="contact")
+
+                best_score = matthews_corrcoef(
+                    np.concatenate([label_g, label_contact]),
+                    np.concatenate([pred_g > best_th_g, pred_contact > best_th_contact]),
+                )
+
+                logger.info(f"***************** epoch {epoch} *****************")
+                logger.info(f"best: {best_score}")
+                logger.info(f"******************************************")
+                if type(config) == ConfigForTransformer:
+                    df_pred.to_csv(f"{output_dir}/pred_{epoch}.csv", index=False)
+                else:
+                    pd.merge(df_label_val, df_pred, how="left").to_csv(f"{output_dir}/pred_{epoch}.csv", index=False)
+                if not config.debug:
+                    torch.save(model.state_dict(), f"{output_dir}/epoch{epoch}.pth")
+
+                results.append({
+                    col: best_score,
+                })
                 wandb.log({
-                    "best_score": total_best_score,
-                    "best_score_g": best_score_g,
-                    "best_score_contact": best_score_contact,
+                    f"{col}": best_score,
+                    f"{col}_g": best_score_g,
+                    f"{col}_contact": best_score_contact,
                     "epoch": epoch,
                 })
+                if col not in total_best_score or total_best_score[col] < best_score:
+                    total_best_score[col] = best_score
+                    wandb.log({
+                        f"best_{col}": total_best_score[col],
+                        f"best_{col}_g": best_score_g,
+                        f"best_{col}_contact": best_score_contact,
+                        "epoch": epoch,
+                    })
+
+                    if col == "score":
+                        logger.info("save best!")
+                        if type(config) == ConfigForTransformer:
+                            df_pred.to_csv(f"{output_dir}/pred_best.csv", index=False)
+                        else:
+                            pd.merge(df_label_val, df_pred, how="left").to_csv(f"{output_dir}/pred_best.csv",
+                                                                               index=False)
+                        if not config.debug:
+                            torch.save(model.state_dict(), f"{output_dir}/best.pth")
 
             pd.DataFrame(results).to_csv(f"{output_dir}/results.csv", index=False)
 
-            if "cnn_2d_" in config.model_name and config.save_feature:
-                logger.info("save feature")
-                save_feature(model, device, config)
+        if "cnn_2d_" in config.model_name and config.save_feature:
+            logger.info("save feature")
+            save_feature(model, device, config)
 
         wandb.finish()
     except Exception as e:
@@ -2068,484 +2195,995 @@ def main(config):
 
 
 if __name__ == "__main__":
-    # exp_name = f"transformer_residual"
-    # config = ConfigForTransformer(exp_name=exp_name, residual=True)
-    # main(config)
 
-    # for num_layer_transformer in [2, 3, 4]:
-    #     exp_name = f"transformer_encdec{num_layer_transformer}"
-    #     config = ConfigForTransformer(exp_name=exp_name, num_layer_transformer=num_layer_transformer, transformer="transformer")
-    #     main(config)
-    #
-    # for hidden_size_transformer in [64, 256, 512]:
-    #     exp_name = f"transformer_encdec{num_layer_transformer}"
-    #     config = ConfigForTransformer(exp_name=exp_name, hidden_size_transformer=hidden_size_transformer, transformer="transformer")
-    #     main(config)
-    #
-    # for n_features in [50, 100, 200, 400]:
-    #     exp_name = f"transformer_n_features{n_features}"
-    #     use_features = pd.read_csv(
-    #         "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
-    #     )["col"].values[:n_features]
-    #     config = ConfigForTransformer(exp_name=exp_name, use_features=use_features)
-    #     main(config)
-    #
-    # for weight_decay in [0.1, 0.001]:
-    #     exp_name = f"transformer_n_features{n_features}"
-    #     config = ConfigForTransformer(exp_name=exp_name, weight_decay=weight_decay)
-    #     main(config)
-    #
-    # for dropout_transformer in [0, 0.2, 0.5]:
-    #     exp_name = f"transformer_dropout_transformer{dropout_transformer}"
-    #     config = ConfigForTransformer(exp_name=exp_name, dropout_transformer=dropout_transformer)
-    #     main(config)
-    #
-    # for hidden_size in [128, 256, 512, 1024]:
-    #     exp_name = f"2d1d_hiddensize{hidden_size}"
-    #     config = Config(exp_name=exp_name, n_frames=303, seq_model="1dcnn_simple",
-    #                     model_name=f"cnn_2d1d", step=3, epochs=2,
-    #                     step_size_ratio=0.6,
-    #                     negative_sample_ratio_far=0.2,
-    #                     negative_sample_ratio_close=0.2,
-    #                     batch_size=32,
-    #                     hidden_size_1d=hidden_size,
-    #                     kernel_size_conv1d=31,
-    #                     stride_conv1d=8,
-    #                     lr_fc=1e-3,
-    #                     n_predict_frames=3,
-    #                     interpolate_image=False,
-    #                     calc_single_view_loss_weight=1,
-    #                     image_feature_dir="../../output/cnn_3d/exp036/20230123182541_2d_pretrain_legacy_seresnet18"
-    #                     )
-    #     main(config)
-    #
-    # for step_size_ratio in [0.8, 1]:
-    #     exp_name = f"2d1d_step_size_ratio{step_size_ratio}"
-    #     config = Config(exp_name=exp_name, n_frames=303, seq_model="1dcnn_simple",
-    #                     model_name=f"cnn_2d1d", step=3, epochs=2,
-    #                     step_size_ratio=step_size_ratio,
-    #                     negative_sample_ratio_far=0.2,
-    #                     negative_sample_ratio_close=0.2,
-    #                     batch_size=32,
-    #                     kernel_size_conv1d=31,
-    #                     stride_conv1d=8,
-    #                     lr_fc=1e-3,
-    #                     n_predict_frames=3,
-    #                     interpolate_image=False,
-    #                     calc_single_view_loss_weight=1,
-    #                     image_feature_dir="../../output/cnn_3d/exp036/20230123182541_2d_pretrain_legacy_seresnet18"
-    #                     )
-    #     main(config)
-    #
-    # for g_ratio in [0.05, 0.2, 0.3]:
-    #     for close_ratio in [0.5, 1]:
-    #         exp_name = f"2d1d_g{g_ratio}_close{close_ratio}"
-    #         config = Config(exp_name=exp_name, n_frames=303, seq_model="1dcnn_simple",
-    #                         model_name=f"cnn_2d1d", step=3, epochs=2,
-    #                         step_size_ratio=0.6,
-    #                         negative_sample_ratio_g=g_ratio,
-    #                         negative_sample_ratio_far=0.1,
-    #                         negative_sample_ratio_close=close_ratio,
-    #                         batch_size=32,
-    #                         kernel_size_conv1d=31,
-    #                         stride_conv1d=8,
-    #                         lr_fc=1e-3,
-    #                         n_predict_frames=3,
-    #                         interpolate_image=False,
-    #                         calc_single_view_loss_weight=1,
-    #                         image_feature_dir="../../output/cnn_3d/exp036/20230123182541_2d_pretrain_legacy_seresnet18"
-    #                         )
-    #         main(config)
-    #
-    # exp_name = f"2.5d3d_v10_192x144"
+    # exp_name = f"2.5d3d_v13_sep_is_g_all"
     # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
     #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
-    #                 step_size_ratio=0.6,
+    #                 step_size_ratio=1.5,
     #                 hidden_size_3d=512,
-    #                 negative_sample_ratio_close=0.2,
-    #                 negative_sample_ratio_far=0.2,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.1,
     #                 gradient_clipping=10,
     #                 interpolate_image=False,
+    #                 image_path="images_128x96_v13",
     #                 lr_fc=1e-3,
     #                 lr=1e-4,
-    #                 img_shape=(144, 192),
-    #                 image_path="images_192x144_v10",
     #                 n_predict_frames=3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # exp_name = f"3d_192x144"
-    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 step=3,
-    #                 epochs=2,
-    #                 step_size_ratio=0.6,
-    #                 model_name="cnn_3d_r3d_18",
-    #                 n_predict_frames=3,
-    #                 batch_size=24,
-    #                 lr_fc=1e-3,
-    #                 img_shape=(144, 192),
-    #                 image_path="images_192x144_v10",
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    #
-    # exp_name = f"3d_n_frames9"
-    # config = Config(exp_name=exp_name, n_frames=9, seq_model="flatten",
-    #                 step=3,
-    #                 epochs=2,
-    #                 step_size_ratio=0.6,
-    #                 model_name="cnn_3d_r3d_18",
-    #                 n_predict_frames=1,
-    #                 lr_fc=1e-3,
-    #                 calc_single_view_loss_weight=1,
-    #                 )
-    # main(config)
-    #
-    # exp_name = f"3d_step5"
-    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-    #                 step=5,
-    #                 epochs=2,
-    #                 step_size_ratio=0.6,
-    #                 model_name="cnn_3d_r3d_18",
-    #                 n_predict_frames=3,
-    #                 lr_fc=1e-3,
     #                 calc_single_view_loss_weight=1,
     #                 )
     # main(config)
 
-    exp_name = f"2.5d3d_seq_model_short"
+    # exp_name = f"3d_v13_sep_is_g_all"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_128x96_v13",
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v13_sep_is_g_all_n_predict_frames13"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.1,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v13",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=13,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v13_n_pred13_sep_is_g_all_n_predict_frames13_close1"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=1,
+    #                 negative_sample_ratio_far=0.1,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v13",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=13,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v13_n_pred13_sep_is_g_all_n_predict_frames13_g0.2-close1_stepsize0.8"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=0.8,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.2,
+    #                 negative_sample_ratio_close=1,
+    #                 negative_sample_ratio_far=0.1,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v13",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=13,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"3d_v13_sep_is_g_all_n_predict_frames7"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=7,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_128x96_v13",
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v14"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.1,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v14",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v15"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.1,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x128_v15",
+    #                 img_shape=(128, 128),
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"3d_v14"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_128x96_v14",
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # model = "legacy_seresnet34_v14"
+    # exp_name = f"2d_pretrain_{model}"
+    # config = Config(exp_name=exp_name, seq_model="1dcnn_simple",
+    #                 model_name=f"cnn_2d_{model}", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 n_frames=23,
+    #                 image_path="images_128x96_v14",
+    #                 negative_sample_ratio_far=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_g=0.1,
+    #                 kernel_size_conv1d=3,
+    #                 stride_conv1d=1,
+    #                 batch_size=32,
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 save_feature=False,
+    #                 interpolate_image=False,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    # #
+    # exp_name = f"3d_v15"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_128x128_v15",
+    #                 img_shape=(128, 128),
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+
+    # for negative_sample_ratio_far in [0.2, 0.3]:
+    #     exp_name = f"2.5d3d_v13_sep_is_g_all_negativefar{negative_sample_ratio_far}"
+    #     config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                     model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                     step_size_ratio=1.5,
+    #                     hidden_size_3d=512,
+    #                     negative_sample_ratio_g=0.1,
+    #                     negative_sample_ratio_close=0.3,
+    #                     negative_sample_ratio_far=negative_sample_ratio_far,
+    #                     gradient_clipping=10,
+    #                     interpolate_image=False,
+    #                     image_path="images_128x96_v13",
+    #                     lr_fc=1e-3,
+    #                     lr=1e-4,
+    #                     n_predict_frames=3,
+    #                     calc_single_view_loss_weight=1,
+    #                     )
+    #     main(config)
+    # exp_name = f"2.5d3d_v13_sep_is_g_all_negativefar0.3-close1"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=1,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v13",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v16_sep_is_g_all_negativefar0.3-close0.3"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v16",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v13_sep_is_g_all_negativefar0.3-close0.3-stepsize0.9"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=0.9,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=1,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v13",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v13_sep_is_g_all_negativefar0.5-close0.5"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.5,
+    #                 negative_sample_ratio_far=0.5,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v13",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v13_sep_is_g_all_negativefar0.5-close0.5-stepsize0.9"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=0.9,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.5,
+    #                 negative_sample_ratio_far=0.5,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v13",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v13_sep_is_g_all_g0.2-negativefar0.5-close0.5"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.2,
+    #                 negative_sample_ratio_close=0.5,
+    #                 negative_sample_ratio_far=0.5,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v13",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    #
+    # exp_name = f"2.5d3d_v13_sep_is_g_all_g0.2-negativefar0.5-close0.5-step0.9"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=0.9,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.2,
+    #                 negative_sample_ratio_close=0.5,
+    #                 negative_sample_ratio_far=0.5,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v13",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+
+    # exp_name = f"3d_v16"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_128x96_v16",
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"3d_v16_0.1-0.3-0.1"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_128x96_v16",
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v16_only_g"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 only_g=True,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v16",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+
+    # exp_name = f"3d_v16_0.05-0.1-0.1"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.05,
+    #                 negative_sample_ratio_close=0.1,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_128x96_v16",
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"3d_v13_0.1-0.1-0.1"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.1,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_128x96_v13",
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v17"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v17",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+
+    # model = "legacy_seresnet34"
+    # exp_name = f"2d_pretrain_{model}"
+    # config = Config(exp_name=exp_name, seq_model="1dcnn_simple",
+    #                 model_name=f"cnn_2d_{model}",
+    #                 epochs=2,
+    #                 step=4,
+    #                 step_size_ratio=1.5,
+    #                 n_frames=31,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_far=0.3,
+    #                 negative_sample_ratio_close=0.3,
+    #                 kernel_size_conv1d=3,
+    #                 stride_conv1d=1,
+    #                 batch_size=32,
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 interpolate_image=False,
+    #                 calc_single_view_loss_weight=1,
+    #                 save_feature=True,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v19"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v19",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v18"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v18",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2d3d_simple"
+    # config = Config(exp_name=exp_name, n_frames=101, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2d3d", step=3, epochs=2,
+    #                 kernel_size_3d=(7, 3, 3),
+    #                 stride_3d=(2, 1, 1),
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=128,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_far=0.3,
+    #                 negative_sample_ratio_close=0.3,
+    #                 batch_size=32,
+    #                 kernel_size_conv1d=31,
+    #                 lr_fc=1e-3,
+    #                 n_predict_frames=3,
+    #                 interpolate_image=False,
+    #                 calc_single_view_loss_weight=1,
+    #                 image_path="../../../output/cnn_3d/exp046/20230204232006_2d_pretrain_legacy_seresnet34/2d",
+    #                 extention=".npy"
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2d3d_stack"
+    # config = Config(exp_name=exp_name, n_frames=101, seq_model="3dcnn_stack",
+    #                 model_name=f"cnn_2d3d", step=2, epochs=2,
+    #                 kernel_size_3d=(31, 3, 3),
+    #                 stride_3d=(11, 1, 1),
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=128,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_far=0.3,
+    #                 negative_sample_ratio_close=0.3,
+    #                 batch_size=32,
+    #                 kernel_size_conv1d=31,
+    #                 lr_fc=1e-3,
+    #                 n_predict_frames=3,
+    #                 stack_dilations=(1, 2, 3),
+    #                 interpolate_image=False,
+    #                 calc_single_view_loss_weight=1,
+    #                 image_path="../../../output/cnn_3d/exp046/20230204232006_2d_pretrain_legacy_seresnet34/2d",
+    #                 extention=".npy"
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_0.1-0.1-0.1_4epochs"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=4, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.1,
+    #                 negative_sample_ratio_far=0.1,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v13",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"3d_v13_0.05-0.1-0.1_3epochs"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=3,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.1,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_128x96_v13",
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v20"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v20",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"3d_v20"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.1,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_128x96_v20",
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # for fold in [4]:
+    #     exp_name = f"2.5d3d_v13_fold{fold}"
+    #     config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                     model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                     step_size_ratio=1.5,
+    #                     hidden_size_3d=512,
+    #                     negative_sample_ratio_g=0.1,
+    #                     negative_sample_ratio_close=0.3,
+    #                     negative_sample_ratio_far=0.3,
+    #                     gradient_clipping=10,
+    #                     interpolate_image=False,
+    #                     image_path="images_128x96_v13",
+    #                     lr_fc=1e-3,
+    #                     lr=1e-4,
+    #                     fold=fold,
+    #                     n_predict_frames=3,
+    #                     calc_single_view_loss_weight=1,
+    #                     )
+    #     main(config)
+    #
+    #
+    # for singleview_loss in [0.5, 0.25]:
+    #     exp_name = f"3d_v13_singleview_loss{singleview_loss}"
+    #     config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                     step=3, epochs=2,
+    #                     step_size_ratio=1.5,
+    #                     negative_sample_ratio_g=0.1,
+    #                     negative_sample_ratio_close=0.1,
+    #                     negative_sample_ratio_far=0.1,
+    #                     model_name="cnn_3d_r3d_18",
+    #                     n_predict_frames=3,
+    #                     lr_fc=1e-3,
+    #                     image_path="images_128x96_v13",
+    #                     calc_single_view_loss_weight=singleview_loss,
+    #                     )
+    #     main(config)
+    #
+    # exp_name = f"3d_v21"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.1,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_128x96_v21",
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+
+    # exp_name = f"2.5d3d_v21"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v21",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v21_maxpool"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v21",
+    #                 pooling="maxpool",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v21_transformerwindow5"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v21",
+    #                 feature_window=5,
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # kernel_size_3d = [(3, 2, 2), (2, 2, 2)]
+    # stride_3d = [(2, 1, 1), (1, 1, 1)]
+    # exp_name = f"2.5d3d_v21_2layers_kernel{kernel_size_3d}_stride{stride_3d}"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_2layers",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 kernel_size_3d=kernel_size_3d,
+    #                 stride_3d=stride_3d,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v21",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+
+    # model = "legacy_seresnet18"
+    # exp_name = f"2d3d_{model}_simple_frame51_stpe3"
+    # config = Config(exp_name=exp_name, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2d_{model}", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 n_frames=51,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_far=0.3,
+    #                 negative_sample_ratio_close=0.3,
+    #                 batch_size=32,
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 interpolate_image=False,
+    #                 calc_single_view_loss_weight=1,
+    #                 save_feature=True,
+    #                 )
+    # main(config)
+    #
+    # for stack_dilations in [(1, 2), (1, 2, 3)]:
+    #     model = "legacy_seresnet18"
+    #     exp_name = f"2d3d_{model}_stack_frame69_step2_stack{stack_dilations}"
+    #     config = Config(exp_name=exp_name, seq_model="3dcnn_stack",
+    #                     model_name=f"cnn_2d_{model}", epochs=2, step=2,
+    #                     step_size_ratio=1.5,
+    #                     n_frames=69,
+    #                     negative_sample_ratio_g=0.1,
+    #                     negative_sample_ratio_far=0.3,
+    #                     negative_sample_ratio_close=0.3,
+    #                     batch_size=32,
+    #                     n_predict_frames=3,
+    #                     lr_fc=1e-3,
+    #                     stack_dilations=stack_dilations,
+    #                     interpolate_image=False,
+    #                     calc_single_view_loss_weight=1,
+    #                     save_feature=True,
+    #                     )
+    #     main(config)
+    #
+    # exp_name = f"3d_v21_96x96_n_frames63"
+    # config = Config(exp_name=exp_name, n_frames=63, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.1,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_96x96_v21",
+    #                 img_shape=(96, 96),
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v21_96x96"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_96x96_v21",
+    #                 img_shape=(96, 96),
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"3d_v21_96x96"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.1,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_96x96_v21",
+    #                 img_shape=(96, 96),
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    #
+    # kernel_size_3d = [(5, 2, 2), (2, 2, 2)]
+    # stride_3d = [(2, 1, 1), (1, 1, 1)]
+    # exp_name = f"2.5d3d_v21_2layers_kernel{kernel_size_3d}_stride{stride_3d}"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_2layers",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 kernel_size_3d=kernel_size_3d,
+    #                 stride_3d=stride_3d,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v21",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # kernel_size_3d = [(5, 5, 5), (2, 1, 1)]
+    # stride_3d = [(2, 1, 1), (1, 1, 1)]
+    # exp_name = f"2.5d3d_v21_2layers_kernel{kernel_size_3d}_stride{stride_3d}"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_2layers",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 kernel_size_3d=kernel_size_3d,
+    #                 stride_3d=stride_3d,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v21",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # kernel_size_3d = [(7, 5, 5), (2, 1, 1)]
+    # stride_3d = [(2, 1, 1), (1, 1, 1)]
+    # exp_name = f"2.5d3d_v21_2layers_kernel{kernel_size_3d}_stride{stride_3d}"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_2layers",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 kernel_size_3d=kernel_size_3d,
+    #                 stride_3d=stride_3d,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v21",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"3d_v21_maxpool+interpolateFalse"
+    # config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
+    #                 step=3, epochs=2,
+    #                 step_size_ratio=1.5,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.1,
+    #                 negative_sample_ratio_far=0.1,
+    #                 model_name="cnn_3d_r3d_18",
+    #                 n_predict_frames=3,
+    #                 pooling="maxpool",
+    #                 interpolate_image=False,
+    #                 lr_fc=1e-3,
+    #                 image_path="images_128x96_v21",
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # exp_name = f"2.5d3d_v21_step2_frame87"
+    # config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
+    #                 model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=2,
+    #                 step_size_ratio=1.5,
+    #                 hidden_size_3d=512,
+    #                 negative_sample_ratio_g=0.1,
+    #                 negative_sample_ratio_close=0.3,
+    #                 negative_sample_ratio_far=0.3,
+    #                 gradient_clipping=10,
+    #                 interpolate_image=False,
+    #                 image_path="images_128x96_v21",
+    #                 lr_fc=1e-3,
+    #                 lr=1e-4,
+    #                 n_predict_frames=3,
+    #                 calc_single_view_loss_weight=1,
+    #                 )
+    # main(config)
+    #
+    # for n_features in [100, 200, 400]:
+    #     for hidden_size_transformer in [128, 512]:
+    #         for nhead in [4, 8, 16]:
+    #             use_features = use_features = pd.read_csv(
+    #                 "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
+    #             )["col"].values[:n_features]
+    #             exp_name = f"transformer_mask_{n_features}_hid{hidden_size_transformer}_nhead{nhead}"
+    #             config = ConfigForTransformer(exp_name=exp_name,
+    #                                           hidden_size_transformer=hidden_size_transformer,
+    #                                           use_features=use_features,
+    #                                           nhead=nhead,
+    #                                           )
+    #             main(config)
+    #
+    # for n_predict_frames in [5, 9]:
+    #     exp_name = f"2.5d3d_v21_step2_frame141_n_pred{n_predict_frames}"
+    #     config = Config(exp_name=exp_name, n_frames=141, seq_model="3dcnn_simple",
+    #                     model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=2,
+    #                     step_size_ratio=1.5,
+    #                     hidden_size_3d=512,
+    #                     negative_sample_ratio_g=0.1,
+    #                     negative_sample_ratio_close=0.3,
+    #                     negative_sample_ratio_far=0.3,
+    #                     gradient_clipping=10,
+    #                     interpolate_image=False,
+    #                     image_path="images_128x96_v21",
+    #                     lr_fc=1e-3,
+    #                     lr=1e-4,
+    #                     n_predict_frames=n_predict_frames,
+    #                     calc_single_view_loss_weight=1,
+    #                     )
+    #     main(config)
+
+    exp_name = f"2.5d3d_v22"
     config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
                     model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
-                    step_size_ratio=0.6,
-                    seq_model_short=True,
-                    hidden_size_3d=512,
-                    negative_sample_ratio_close=0.2,
-                    negative_sample_ratio_far=0.2,
-                    gradient_clipping=10,
-                    interpolate_image=False,
-                    lr_fc=1e-3,
-                    lr=1e-4,
-                    n_predict_frames=3,
-                    calc_single_view_loss_weight=1,
-                    )
-    main(config)
-
-    for negative_sample_ratio_close in [0.1, 0.3, 0.5]:
-        exp_name = f"2.5d3d_4epochs_g0.05_negative_sample_ratio_close{negative_sample_ratio_close}"
-        config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-                        model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=4, step=3,
-                        step_size_ratio=1.5,
-                        hidden_size_3d=512,
-                        negative_sample_ratio_g=0.05,
-                        negative_sample_ratio_close=0.2,
-                        negative_sample_ratio_far=0.1,
-                        gradient_clipping=10,
-                        interpolate_image=False,
-                        lr_fc=1e-3,
-                        lr=1e-4,
-                        n_predict_frames=3,
-                        calc_single_view_loss_weight=1,
-                        )
-        main(config)
-
-    exp_name = f"2.5d3d_4epochs_g0.1_negative_sample_ratio_close0.3"
-    config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=4, step=3,
                     step_size_ratio=1.5,
                     hidden_size_3d=512,
                     negative_sample_ratio_g=0.1,
                     negative_sample_ratio_close=0.3,
-                    negative_sample_ratio_far=0.1,
+                    negative_sample_ratio_far=0.3,
                     gradient_clipping=10,
                     interpolate_image=False,
+                    image_path="images_128x96_v22",
                     lr_fc=1e-3,
                     lr=1e-4,
                     n_predict_frames=3,
                     calc_single_view_loss_weight=1,
                     )
     main(config)
-
-    exp_name = f"2.5d3d_3epochs_g0.1_negative_sample_ratio_close0.3"
-    config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=3, step=3,
-                    step_size_ratio=1.2,
-                    hidden_size_3d=512,
-                    negative_sample_ratio_g=0.1,
-                    negative_sample_ratio_close=0.3,
-                    negative_sample_ratio_far=0.1,
-                    gradient_clipping=10,
-                    interpolate_image=False,
-                    lr_fc=1e-3,
-                    lr=1e-4,
-                    n_predict_frames=3,
-                    calc_single_view_loss_weight=1,
-                    )
-    main(config)
-
-    exp_name = f"2.5d3d_3epochs_g0.2_contact0.2_0.2"
-    config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=3, step=3,
-                    step_size_ratio=1.2,
-                    hidden_size_3d=512,
-                    negative_sample_ratio_g=0.2,
-                    negative_sample_ratio_close=0.2,
-                    negative_sample_ratio_far=0.2,
-                    gradient_clipping=10,
-                    interpolate_image=False,
-                    lr_fc=1e-3,
-                    lr=1e-4,
-                    n_predict_frames=3,
-                    calc_single_view_loss_weight=1,
-                    )
-    main(config)
-
-    exp_name = f"2.5d3d_3epochs_g0.2_contact0.3_0.1"
-    config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=3, step=3,
-                    step_size_ratio=1.2,
-                    hidden_size_3d=512,
-                    negative_sample_ratio_g=0.2,
-                    negative_sample_ratio_close=0.3,
-                    negative_sample_ratio_far=0.1,
-                    gradient_clipping=10,
-                    interpolate_image=False,
-                    lr_fc=1e-3,
-                    lr=1e-4,
-                    n_predict_frames=3,
-                    calc_single_view_loss_weight=1,
-                    )
-    main(config)
-
-    exp_name = f"2.5d3d_3epochs_g0.2_contact0.2_0.2_linear"
-    config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=3, step=3,
-                    scheduler="linear",
-                    hidden_size_3d=512,
-                    negative_sample_ratio_g=0.2,
-                    negative_sample_ratio_close=0.2,
-                    negative_sample_ratio_far=0.2,
-                    gradient_clipping=10,
-                    interpolate_image=False,
-                    lr_fc=1e-3,
-                    lr=1e-4,
-                    n_predict_frames=3,
-                    calc_single_view_loss_weight=1,
-                    )
-    main(config)
-
-    for step in [2, 4, 5]:
-        exp_name = f"2.5d3d_step{step}"
-        config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-                        model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=step,
-                        step_size_ratio=0.6,
-                        hidden_size_3d=512,
-                        negative_sample_ratio_close=0.2,
-                        negative_sample_ratio_far=0.2,
-                        gradient_clipping=10,
-                        interpolate_image=False,
-                        lr_fc=1e-3,
-                        lr=1e-4,
-                        n_predict_frames=3,
-                        calc_single_view_loss_weight=1,
-                        )
-        main(config)
-
-    exp_name = f"3d_n_frames23"
-    config = Config(exp_name=exp_name, n_frames=23, seq_model="flatten",
-                    step=3,
-                    epochs=2,
-                    step_size_ratio=0.6,
-                    model_name="cnn_3d_r3d_18",
-                    n_predict_frames=3,
-                    lr_fc=1e-3,
-                    calc_single_view_loss_weight=1,
-                    )
-    main(config)
-
-    for step in [2, 7]:
-        exp_name = f"3d_step{step}"
-        config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-                        step=step,
-                        epochs=2,
-                        step_size_ratio=0.6,
-                        model_name="cnn_3d_r3d_18",
-                        n_predict_frames=3,
-                        lr_fc=1e-3,
-                        calc_single_view_loss_weight=1,
-                        )
-        main(config)
-
-    exp_name = f"3d_n_predict_frames5"
-    config = Config(exp_name=exp_name, n_frames=31, seq_model="flatten",
-                    step=3,
-                    epochs=2,
-                    step_size_ratio=0.6,
-                    model_name="cnn_3d_r3d_18",
-                    n_predict_frames=5,
-                    lr_fc=1e-3,
-                    calc_single_view_loss_weight=1,
-                    )
-    main(config)
-
-    model = "legacy_seresnet34"
-    exp_name = f"2d_pretrain_{model}"
-    config = Config(exp_name=exp_name, seq_model="1dcnn_simple",
-                    model_name=f"cnn_2d_{model}", epochs=2, step=4,
-                    step_size_ratio=0.6,
-                    n_frames=23,
-                    negative_sample_ratio_far=0.2,
-                    negative_sample_ratio_close=0.2,
-                    kernel_size_conv1d=3,
-                    stride_conv1d=1,
-                    batch_size=32,
-                    n_predict_frames=3,
-                    lr_fc=1e-3,
-                    interpolate_image=False,
-                    calc_single_view_loss_weight=1,
-                    save_feature=True,
-                    )
-    main(config)
-
-    for warmup_ratio in [0.05, 0.2]:
-        exp_name = f"2.5d3d_warmup{warmup_ratio}"
+    for fold in [2, 1, 0]:
+        exp_name = f"2.5d3d_v13_fold{fold}"
         config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
                         model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
-                        step_size_ratio=0.6,
+                        step_size_ratio=1.5,
                         hidden_size_3d=512,
-                        warmup_ratio=warmup_ratio,
-                        negative_sample_ratio_close=0.2,
-                        negative_sample_ratio_far=0.2,
+                        negative_sample_ratio_g=0.1,
+                        negative_sample_ratio_close=0.3,
+                        negative_sample_ratio_far=0.3,
                         gradient_clipping=10,
                         interpolate_image=False,
+                        image_path="images_128x96_v13",
                         lr_fc=1e-3,
                         lr=1e-4,
+                        fold=fold,
                         n_predict_frames=3,
                         calc_single_view_loss_weight=1,
                         )
         main(config)
-
-    kernel_size_3d = (3, 5, 5)
-    stride_3d = (1, 1, 1)
-
-    exp_name = f"2.5d3d_kernel_size{kernel_size_3d}_stride{stride_3d}"
-    config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
-                    step_size_ratio=0.6,
-                    hidden_size_3d=512,
-                    kernel_size_3d=kernel_size_3d,
-                    stride_3d=stride_3d,
-                    negative_sample_ratio_close=0.2,
-                    negative_sample_ratio_far=0.2,
-                    gradient_clipping=10,
-                    interpolate_image=False,
-                    lr_fc=1e-3,
-                    lr=1e-4,
-                    n_predict_frames=3,
-                    calc_single_view_loss_weight=1,
-                    )
-    main(config)
-
-    kernel_size_3d = (13, 5, 5)
-    stride_3d = (3, 1, 1)
-
-    exp_name = f"2.5d3d_kernel_size{kernel_size_3d}_stride{stride_3d}"
-    config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
-                    step_size_ratio=0.6,
-                    hidden_size_3d=512,
-                    kernel_size_3d=kernel_size_3d,
-                    stride_3d=stride_3d,
-                    negative_sample_ratio_close=0.2,
-                    negative_sample_ratio_far=0.2,
-                    gradient_clipping=10,
-                    interpolate_image=False,
-                    lr_fc=1e-3,
-                    lr=1e-4,
-                    n_predict_frames=3,
-                    calc_single_view_loss_weight=1,
-                    )
-    main(config)
-
-    kernel_size_3d = (7, 3, 3)
-    stride_3d = (2, 2, 2)
-
-    exp_name = f"2.5d3d_kernel_size{kernel_size_3d}_stride{stride_3d}"
-    config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
-                    step_size_ratio=0.6,
-                    hidden_size_3d=512,
-                    kernel_size_3d=kernel_size_3d,
-                    stride_3d=stride_3d,
-                    negative_sample_ratio_close=0.2,
-                    negative_sample_ratio_far=0.2,
-                    gradient_clipping=10,
-                    interpolate_image=False,
-                    lr_fc=1e-3,
-                    lr=1e-4,
-                    n_predict_frames=3,
-                    calc_single_view_loss_weight=1,
-                    )
-    main(config)
-
-    exp_name = f"2.5d3d_resnet34_base"
-    config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
-                    step_size_ratio=0.6,
-                    hidden_size_3d=512,
-                    negative_sample_ratio_close=0.2,
-                    negative_sample_ratio_far=0.2,
-                    gradient_clipping=10,
-                    interpolate_image=False,
-                    lr_fc=1e-3,
-                    lr=1e-4,
-                    n_predict_frames=3,
-                    calc_single_view_loss_weight=1,
-                    )
-    main(config)
-
-    kernel_size_3d = (7, 4, 4)
-    stride_3d = (2, 1, 1)
-
-    exp_name = f"2.5d3d_resnet34_kernel_size{kernel_size_3d}_stride{stride_3d}"
-    config = Config(exp_name=exp_name, n_frames=87, seq_model="3dcnn_simple",
-                    model_name=f"cnn_2.5d3d_legacy_seresnet18", epochs=2, step=3,
-                    step_size_ratio=0.6,
-                    hidden_size_3d=512,
-                    kernel_size_3d=kernel_size_3d,
-                    stride_3d=stride_3d,
-                    negative_sample_ratio_close=0.2,
-                    negative_sample_ratio_far=0.2,
-                    gradient_clipping=10,
-                    interpolate_image=False,
-                    lr_fc=1e-3,
-                    lr=1e-4,
-                    n_predict_frames=3,
-                    calc_single_view_loss_weight=1,
-                    )
-    main(config)
-
-    # for i in range(1000):
-    #     params = {
-    #         "dropout_transformer": np.random.choice([0, 0.1, 0.2, 0.5]),
-    #         "num_layer_transformer": np.random.choice([1, 2, 3, 4]),
-    #         "epochs": np.random.choice([3, 4, 5, 6, 7]),
-    #         "weight_decay": np.random.choice([0, 0.1, 0.01, 0.001]),
-    #         "hidden_size_transformer": np.random.choice([128, 256, 512]),
-    #         "residual": np.random.choice([False, False, False, True]),
-    #         "warmup_ratio": np.random.choice([0.01, 0.05, 0.1]),
-    #         "nhead": np.random.choice([8, 16, 32]),
-    #     }
-    #     n_features = np.random.choice([50, 100, 200, 400, 600])
-    #     use_features = pd.read_csv(
-    #         "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
-    #     )["col"].values[:n_features]
-    #
-    #     exp_name = f"transformer_randomseed"
-    #     config = ConfigForTransformer(
-    #         exp_name=exp_name,
-    #         use_features=use_features,
-    #         **params
-    #     )
-    #     main(config)

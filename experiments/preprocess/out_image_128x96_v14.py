@@ -5,18 +5,18 @@ import numpy as np
 import tqdm
 
 
-CONTACT = (0, 0, 0)
-AWAY = (0, 78, 255)
-HOME = (255, 255, 255)
-PLAYER = (255, 0, 0)
+CONTACT = (92, 0, 0)
+AWAY = (255, 96, 255)
+PLAYER = (232, 255, 232)
+HOME = (192, 0, 128)
 output_size = (128, 96)
-output_dir = f"../../../work/images_{output_size[0]}x{output_size[1]}_v12"
+output_dir = f"../../../work/images_{output_size[0]}x{output_size[1]}_v14"
 traintest = "train"
 
 bbox_left_ratio = 4.5
 bbox_right_ratio = 4.5
-bbox_top_ratio = 4
-bbox_down_ratio = 2
+bbox_top_ratio = 4.5
+bbox_down_ratio = 2.25
 
 def load_video(video_path):
     vidcap = cv2.VideoCapture(video_path)
@@ -124,6 +124,7 @@ def main():
         gp = join_helmets_contact(game_play, df_labels, df_helmets, df_meta)
         for col in ["x", "y", "width", "height"]:
             gp[col] = gp[[f"{col}_1", f"{col}_2"]].mean(axis=1)
+        gp["bbox_size"] = gp[["width", "height"]].mean(axis=1)
         for view in ["Endzone", "Sideline"]:
             gp_ = gp[gp["view"] == view]
 
@@ -160,8 +161,6 @@ def main():
                         PLAYER,
                         thickness=-1,
                     )
-                img_[::96, :, :] = 0
-                img_[:, ::96, :] = 0
                 img_ = cv2.addWeighted(src1=img_, alpha=0.75, src2=img_filter, beta=0.25, gamma=0)
                 for key, w_df in data_dict.items():
                     img = img_.copy()
@@ -171,10 +170,10 @@ def main():
                     series = w_df.loc[frame]
                     if np.isnan(series["x"]):
                         continue
-                    left = int(series["x"] - series["width"] * bbox_left_ratio)
-                    right = int(series["x"] + series["width"] * bbox_right_ratio)
-                    top = int(series["y"] + series["height"] * bbox_top_ratio)
-                    down = int(series["y"] - series["height"] * bbox_down_ratio)
+                    left = int(series["x"] - series["bbox_size"] * bbox_left_ratio)
+                    right = int(series["x"] + series["bbox_size"] * bbox_right_ratio)
+                    top = int(series["y"] + series["bbox_size"] * bbox_top_ratio)
+                    down = int(series["y"] - series["bbox_size"] * bbox_down_ratio)
 
                     left = max(0, left)
                     down = max(0, down)
