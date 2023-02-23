@@ -20,8 +20,6 @@ import pickle
 from sklearn.metrics import euclidean_distances
 import warnings
 import json
-from catboost import CatBoost, Pool
-
 warnings.filterwarnings("ignore")
 
 pd.set_option("max_row", 1000)
@@ -91,49 +89,33 @@ def get_logger(output_dir=None, logging_level=logging.INFO):
     return logger
 
 
-class Model:
+class LGBMModel:
     def __init__(self,
                  output_dir: str,
                  logger: Logger,
                  exp_name: str,
-                 model_name: str = "lightgbm",
                  debug: bool = False,
                  use_features: List[str] = None,
                  params: dict = None,
                  fast_mode: bool = True):
         self.logger = logger
-        self.model_name = model_name
         if params is None:
-            if model_name == "lightgbm":
-                self.params = {
-                    'objective': 'binary',
-                    'metrics': 'auc',
-                    'num_leaves': 32,
-                    'max_depth': -1,
-                    'bagging_fraction': 0.7,  # 0.5,
-                    'feature_fraction': 0.7,
-                    'bagging_seed': 0,
-                    'reg_alpha': 1,
-                    'reg_lambda': 1,
-                    'random_state': 0,
-                    'verbosity': -1,
-                    "n_estimators": 20000,
-                    "early_stopping_rounds": 100,
-                    "learning_rate": 0.1,
-                }
-            else:
-                self.params = {
-                    'n_estimators': 12000,
-                    'learning_rate': 0.3,
-                    'eval_metric': 'AUC',
-                    'loss_function': 'Logloss',
-                    'random_seed': 0,
-                    'metric_period': 50,
-                    'od_wait': 400,
-                    'task_type': 'GPU',
-                    'max_depth': 8,
-                    "verbose": 100
-                }
+            self.params = {
+                'objective': 'binary',
+                'metrics': 'auc',
+                'num_leaves': 32,
+                'max_depth': -1,
+                'bagging_fraction': 0.7,  # 0.5,
+                'feature_fraction': 0.7,
+                'bagging_seed': 0,
+                'reg_alpha': 1,
+                'reg_lambda': 1,
+                'random_state': 0,
+                'verbosity': -1,
+                "n_estimators": 20000,
+                "early_stopping_rounds": 100,
+                "learning_rate": 0.1,
+            }
         else:
             self.params = params
         self.debug = debug
@@ -454,53 +436,30 @@ class Model:
 
         if self.use_features is None:
             self.use_features = df_train.drop(self.drop_columns + ["contact"], axis=1).columns
+        dataset_train = lgb.Dataset(df_train[self.use_features], label=df_train["contact"])
+        dataset_val = lgb.Dataset(df_val[self.use_features], label=df_val["contact"])
+        del df_train; gc.collect()
 
         lgb.register_logger(self.logger)
         mlflow.set_tracking_uri('../../mlruns/')
 
         with mlflow.start_run(experiment_id=1, run_name=self.exp_name):
+            self.model = lgb.train(
+                copy.copy(self.params),
+                dataset_train,
+                valid_sets=[dataset_train, dataset_val],
+                verbose_eval=100,
+            )
 
-            if self.model_name == "lightgbm":
-                dataset_train = lgb.Dataset(df_train[self.use_features], label=df_train["contact"])
-                dataset_val = lgb.Dataset(df_val[self.use_features], label=df_val["contact"])
-                del df_train;
-                gc.collect()
+            self.model.save_model(self.model_dir)
 
-                self.model = lgb.train(
-                    copy.copy(self.params),
-                    dataset_train,
-                    valid_sets=[dataset_train, dataset_val],
-                    verbose_eval=100,
-                )
-
-                pd.DataFrame({
-                    "col": self.model.feature_name(),
-                    "imp": self.model.feature_importance("gain") / self.model.feature_importance("gain").sum()
-                }).sort_values("imp", ascending=False).to_csv(f"{self.output_dir}/feature_importance.csv", index=False)
-
-                self.model.save_model(self.model_dir)
-
-                # inference
-                self.model = lgb.Booster(model_file=self.model_dir)
-                if self.fast_mode:
-                    pred = self.model.predict(df_val[self.use_features])
-                    contact_id = df_val["contact_id"].values
-                else:
-                    pred, contact_id = self.predict(df_test)
-
-            elif self.model_name == "catboost":
-                self.model = CatBoost(self.params)
-                train_data = Pool(df_train[self.use_features], label=df_train["contact"])
-                valid_data = Pool(df_val[self.use_features], label=df_val["contact"])
-                self.model.fit(train_data,
-                               eval_set=valid_data,
-                               verbose_eval=100,
-                               use_best_model=True)
-                if self.fast_mode:
-                    pred = self.model.predict(df_val[self.use_features], prediction_type='Probability')[:, 1]
-                    contact_id = df_val["contact_id"].values
-                else:
-                    pred, contact_id = self.predict(df_test)
+            # inference
+            self.model = lgb.Booster(model_file=self.model_dir)
+            if self.fast_mode:
+                pred = self.model.predict(df_val[self.model.feature_name()])
+                contact_id = df_val["contact_id"].values
+            else:
+                pred, contact_id = self.predict(df_test)
 
             df_pred = pd.DataFrame({
                 "contact_id": contact_id,
@@ -534,6 +493,10 @@ class Model:
             mlflow.log_metric("best_score", best_score)
 
             pd.DataFrame({
+                "col": self.model.feature_name(),
+                "imp": self.model.feature_importance("gain") / self.model.feature_importance("gain").sum()
+            }).sort_values("imp", ascending=False).to_csv(f"{self.output_dir}/feature_importance.csv", index=False)
+            pd.DataFrame({
                 "contact_id": df_merge["contact_id"].values,
                 "score": pred
             }).to_csv(f"{self.output_dir}/pred.csv", index=False)
@@ -558,65 +521,36 @@ def main():
         'metrics': 'auc',
         'num_leaves': 128,
         'max_depth': -1,
-        'bagging_fraction': 0.7,  # 0.5,
+        'bagging_fraction': 0.9,  # 0.5,
         'feature_fraction': 0.3,
         'bagging_seed': 0,
-        'reg_alpha': 1,
+        'reg_alpha': 10,
         'reg_lambda': 5,
-        'min_data_in_leaf': 100,
+        'min_data_in_leaf': 10000,
         'random_state': 0,
         'verbosity': -1,
         "n_estimators": 20000,
         "early_stopping_rounds": 100,
         "learning_rate": 0.01,
-        "n_jobs": 32
+        "n_jobs": 8
     }
     # use_features = pd.read_csv("../../output/lgbm/exp013/20230122164447/feature_importance.csv")["col"].values[:400]
-    use_features = pd.read_csv(
-        "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
-    )["col"].values[:500]
 
-    model = Model(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
-                  params=params, use_features=use_features)
+    model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
+                      params=params)
     model.train(df)
     del model.logger
-    #
-    # for depth in [8]:
-    #     output_dir = f"../../output/lgbm/{os.path.basename(__file__).replace('.py', '')}/{dt.now().strftime('%Y%m%d%H%M%S')}"
-    #     os.makedirs(output_dir, exist_ok=True)
-    #     shutil.copy(__file__, output_dir)
-    #     logger = get_logger(output_dir)
-    #     df = pd.read_feather("../../output/preprocess/master_data_v4/gps.feather")
-    #     if debug:
-    #         df = df.head(300000)
-    #     params = {
-    #         'n_estimators': 12000,
-    #         'learning_rate': 0.01,
-    #         'eval_metric': 'AUC',
-    #         'loss_function': 'Logloss',
-    #         'random_seed': 0,
-    #         'metric_period': 50,
-    #         'od_wait': 400,
-    #         'task_type': 'GPU',
-    #         'max_depth': depth,
-    #         "verbose": 100
-    #     }
-    #
-    #     model = Model(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
-    #                   params=params, use_features=use_features, model_name="catboost")
-    #     model.train(df)
-    #     del model.logger
-    #
-    # with open(f"{output_dir}/model.pickle", "wb") as f:
-    #     pickle.dump(model, f)
-    #
+
+    with open(f"{output_dir}/model.pickle", "wb") as f:
+        pickle.dump(model, f)
+
     # for _ in range(1000):
     #     output_dir = f"../../output/lgbm/{os.path.basename(__file__).replace('.py', '')}/{dt.now().strftime('%Y%m%d%H%M%S')}"
     #     os.makedirs(output_dir, exist_ok=True)
     #     shutil.copy(__file__, output_dir)
     #     logger = get_logger(output_dir)
     #
-    #     df = pd.read_feather("../../output/preprocess/master_data_v4/gps.feather")
+    #     df = pd.read_feather("../../output/preprocess/master_data_v3/gps.feather")
     #     if debug:
     #         df = df.head(300000)
     #
@@ -625,23 +559,20 @@ def main():
     #         'metrics': 'auc',
     #         'num_leaves': np.random.choice([16, 32, 64, 128, 256]),
     #         'max_depth': -1,
-    #         'bagging_fraction': np.random.choice([0.5, 0.7, 0.9]),  # 0.5,
-    #         'feature_fraction': np.random.choice([0.05, 0.1, 0.3, 0.5, 0.7]),
+    #         'bagging_fraction': np.random.choice([0.7, 0.9]),  # 0.5,
+    #         'feature_fraction': np.random.choice([0.1, 0.3, 0.5, 0.7, 0.9]),
     #         'bagging_seed': 0,
-    #         'reg_alpha': np.random.choice([0.5, 1, 3, 5, 10]),
-    #         'reg_lambda': np.random.choice([0.5, 1, 3, 5, 10]),
+    #         'reg_alpha': np.random.choice([0, 0.1, 0.5, 1, 3, 5, 10]),
+    #         'reg_lambda': np.random.choice([0, 0.1, 0.5, 1, 3, 5, 10]),
     #         'min_data_in_leaf': np.random.choice([1, 10, 50, 100, 500, 1000, 5000, 10000]),
     #         'random_state': 0,
     #         'verbosity': -1,
     #         "n_estimators": 20000,
     #         "early_stopping_rounds": 100,
     #         "learning_rate": 0.1,
-    #         "n_jobs": 32
+    #         "n_jobs": 8
     #     }
-    #     use_features = pd.read_csv(
-    #         "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
-    #     )["col"].values[:500]
-    #     model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp017", debug=debug, fast_mode=True,
+    #     model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
     #                       params=params, use_features=use_features)
     #     model.train(df)
 

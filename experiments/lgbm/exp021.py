@@ -20,8 +20,6 @@ import pickle
 from sklearn.metrics import euclidean_distances
 import warnings
 import json
-from catboost import CatBoost, Pool
-
 warnings.filterwarnings("ignore")
 
 pd.set_option("max_row", 1000)
@@ -30,9 +28,9 @@ pd.set_option("max_column", 200)
 debug = False
 
 def get_near_player(df_distance, w_df, distance_matrix, name):
-    for distance_th in [1, 3, 5, 7.5, 10, 15]:
+    for distance_th in [1, 2, 3, 5, 7.5, 10, 15]:
         df_distance[f"n_player_distance_{name}_in_{distance_th}"] = (distance_matrix < distance_th).sum(axis=1)
-    for top_n in [1, 3, 5, 7]:
+    for top_n in [1, 2, 3, 5, 7]:
         if len(distance_matrix) <= top_n:
             continue
         col_name = f"distance_top{top_n}"
@@ -91,51 +89,37 @@ def get_logger(output_dir=None, logging_level=logging.INFO):
     return logger
 
 
-class Model:
+class LGBMModel:
     def __init__(self,
                  output_dir: str,
                  logger: Logger,
                  exp_name: str,
-                 model_name: str = "lightgbm",
                  debug: bool = False,
                  use_features: List[str] = None,
                  params: dict = None,
+                 include_helmet_info: bool = True,
                  fast_mode: bool = True):
         self.logger = logger
-        self.model_name = model_name
         if params is None:
-            if model_name == "lightgbm":
-                self.params = {
-                    'objective': 'binary',
-                    'metrics': 'auc',
-                    'num_leaves': 32,
-                    'max_depth': -1,
-                    'bagging_fraction': 0.7,  # 0.5,
-                    'feature_fraction': 0.7,
-                    'bagging_seed': 0,
-                    'reg_alpha': 1,
-                    'reg_lambda': 1,
-                    'random_state': 0,
-                    'verbosity': -1,
-                    "n_estimators": 20000,
-                    "early_stopping_rounds": 100,
-                    "learning_rate": 0.1,
-                }
-            else:
-                self.params = {
-                    'n_estimators': 12000,
-                    'learning_rate': 0.3,
-                    'eval_metric': 'AUC',
-                    'loss_function': 'Logloss',
-                    'random_seed': 0,
-                    'metric_period': 50,
-                    'od_wait': 400,
-                    'task_type': 'GPU',
-                    'max_depth': 8,
-                    "verbose": 100
-                }
+            self.params = {
+                'objective': 'binary',
+                'metrics': 'auc',
+                'num_leaves': 32,
+                'max_depth': -1,
+                'bagging_fraction': 0.7,  # 0.5,
+                'feature_fraction': 0.7,
+                'bagging_seed': 0,
+                'reg_alpha': 1,
+                'reg_lambda': 1,
+                'random_state': 0,
+                'verbosity': -1,
+                "n_estimators": 20000,
+                "early_stopping_rounds": 100,
+                "learning_rate": 0.1,
+            }
         else:
             self.params = params
+        self.include_helmet_info = include_helmet_info
         self.debug = debug
         self.output_dir = output_dir
         self.exp_name = exp_name
@@ -171,19 +155,27 @@ class Model:
             str) + "_" + df["nfl_player_id_2"].astype(str)
 
         self.logger.info("FE1: all features")
-
-        self.logger.info(f"[aggregate view]before: {len(df)}")
         helmet_columns = [
             "left_1", "width_1", "top_1", "height_1", "x_1", "y_1",
             "left_2", "width_2", "top_2", "height_2", "x_2", "y_2",
         ]
-        df_endzone = df[df["view"] == "Endzone"].drop("view", axis=1)
-        df_sideline = df[df["view"] == "Sideline"].drop("view", axis=1)
-        df_endzone.columns = [f"Endzone_{col}" if col in helmet_columns else col for col in df_endzone.columns]
-        df_sideline.columns = [f"Sideline_{col}" if col in helmet_columns else col for col in df_sideline.columns]
-        df = df[["contact_id"]].drop_duplicates()
-        df = pd.merge(df, df_endzone, how="left")
-        df = pd.merge(df, df_sideline, how="left")
+        if self.include_helmet_info:
+            self.logger.info(f"[aggregate view]before: {len(df)}")
+            helmet_columns = [
+                "left_1", "width_1", "top_1", "height_1", "x_1", "y_1",
+                "left_2", "width_2", "top_2", "height_2", "x_2", "y_2",
+            ]
+            df_endzone = df[df["view"] == "Endzone"].drop("view", axis=1)
+            df_sideline = df[df["view"] == "Sideline"].drop("view", axis=1)
+            df_endzone.columns = [f"Endzone_{col}" if col in helmet_columns else col for col in df_endzone.columns]
+            df_sideline.columns = [f"Sideline_{col}" if col in helmet_columns else col for col in df_sideline.columns]
+            df = df[["contact_id"]].drop_duplicates()
+            df = pd.merge(df, df_endzone, how="left")
+            df = pd.merge(df, df_sideline, how="left")
+        else:
+            self.logger.info(f"remove helmet info")
+            df = df.drop_duplicates("contact_id")
+            df = df.drop(helmet_columns, axis=1)
         df = df.sort_values(["game_play", "step", "nfl_player_id_1", "nfl_player_id_2"])
         self.logger.info(f"[aggregate view]after: {df.shape}")
 
@@ -246,14 +238,15 @@ class Model:
             (df["y_position_1"].values - df["y_position_2"]) ** 2
         )
 
-        for view in ["Endzone", "Sideline"]:
-            df[f"{view}_distance_helmet"] = np.sqrt(
-                (df[f"{view}_x_1"].values - df[f"{view}_x_2"]) ** 2 + \
-                (df[f"{view}_y_1"].values - df[f"{view}_y_2"]) ** 2
-            )
-        df[f"distance_helmet_mean"] = df[["Endzone_distance_helmet", "Sideline_distance_helmet"]].mean(axis=1)
-        df[f"distance_helmet_min"] = df[["Endzone_distance_helmet", "Sideline_distance_helmet"]].min(axis=1)
-        df[f"distance_helmet_max"] = df[["Endzone_distance_helmet", "Sideline_distance_helmet"]].max(axis=1)
+        if self.include_helmet_info:
+            for view in ["Endzone", "Sideline"]:
+                df[f"{view}_distance_helmet"] = np.sqrt(
+                    (df[f"{view}_x_1"].values - df[f"{view}_x_2"]) ** 2 + \
+                    (df[f"{view}_y_1"].values - df[f"{view}_y_2"]) ** 2
+                )
+            df[f"distance_helmet_mean"] = df[["Endzone_distance_helmet", "Sideline_distance_helmet"]].mean(axis=1)
+            df[f"distance_helmet_min"] = df[["Endzone_distance_helmet", "Sideline_distance_helmet"]].min(axis=1)
+            df[f"distance_helmet_max"] = df[["Endzone_distance_helmet", "Sideline_distance_helmet"]].max(axis=1)
 
         df["move_sensor"] = df["distance_1"] + df["distance_2"]
 
@@ -267,85 +260,121 @@ class Model:
                     df[f"{col_name}_diff"] = df[f"{col_name}_1"] - df[f"{col_name}_2"]
 
         # group by pair
-        lag_columns = [
+        useful_cols = [
             "distance",
             "move_sensor",
-            "distance_helmet_mean",
-            "distance_helmet_min",
-            "distance_helmet_max",
             "distance_top1",
             "distance_top3",
             "distance_top5",
             "distance_top7",
+            "diff_from_distance_top1",
+            "diff_from_distance_top3",
+            "diff_from_distance_top5",
+            "diff_from_distance_top7",
         ]
+        if self.include_helmet_info:
+            useful_cols += [
+                "distance_helmet_mean",
+                "distance_helmet_min",
+                "distance_helmet_max",
+            ]
 
         # G精度向上のために player_1 のlag情報追加
-        lag_columns += player_features
+        useful_cols += player_features
 
-        for view in ["Endzone", "Sideline"]:
-            lag_columns.extend([
-                f"{view}_x_1",
-                f"{view}_x_2",
-                f"{view}_y_1",
-                f"{view}_y_2",
-                f"{view}_distance_helmet",
-            ])
+        if self.include_helmet_info:
+            for view in ["Endzone", "Sideline"]:
+                useful_cols.extend([
+                    f"{view}_x_1",
+                    f"{view}_x_2",
+                    f"{view}_y_1",
+                    f"{view}_y_2",
+                    f"{view}_distance_helmet",
+                ])
         self.logger.info(f"groupby features: {df.shape}")
 
         # TODO: speedup
-        for lag in tqdm.tqdm([1, 5, 10, 20, -1, -5, -10, -20]):
-            lag_cols = [f"{lag_column}_lag{lag}" for lag_column in lag_columns]
-            df[lag_cols] = df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])[lag_columns].shift(lag)
-            diff_cols = [f"{lag_column}_diff{lag}" for lag_column in lag_columns]
-            df[diff_cols] = df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])[lag_columns].diff(lag)
+        for lag in tqdm.tqdm([1, 3, 5, 10, 20, -1, -3, -5, -10, -20]):
+            lag_cols = [f"{lag_column}_lag{lag}" for lag_column in useful_cols]
+            df[lag_cols] = df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])[useful_cols].shift(lag)
+            diff_cols = [f"{lag_column}_diff{lag}" for lag_column in useful_cols]
+            df[diff_cols] = df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])[useful_cols].diff(lag)
+
+        for window in tqdm.tqdm([5, 15]):
+            rolling_cols = [f"{lag_column}_window{lag}_mean" for lag_column in useful_cols]
+            df[rolling_cols] = df.groupby(
+                ["game_play", "nfl_player_id_1", "nfl_player_id_2"]
+            )[useful_cols].rolling(window=window, center=True).mean().values
+            diff_cols = [f"{col}_diff{lag}" for col in rolling_cols]
+            df[diff_cols] = df[useful_cols].values - df[rolling_cols].values
+
+        mean_cols = [f"{col}_step_mean" for col in useful_cols]
+        df[mean_cols] = df.groupby(["game_play", "step"])[useful_cols].transform("mean")
+        std_cols = [f"{col}_step_std" for col in useful_cols]
+        df[std_cols] = df.groupby(["game_play", "step"])[useful_cols].transform("std")
+        diff_cols = [f"diff_{col}" for col in mean_cols]
+        df[diff_cols] = df[useful_cols].values - df[mean_cols].values
 
         # 2nd groupby -> memory leakなったら面倒なので後で。。
         self.logger.info(f"groupby features 2nd: {df.shape}")
 
         df = reduce_mem_usage(df)
 
-        for view in ["Endzone", "Sideline"]:
-            df[f"{view}_move_helmet_1"] = np.sqrt(
-                df[f"{view}_x_1_diff1"] ** 2 + df[f"{view}_y_1_diff1"] ** 2)
-            df[f"{view}_move_helmet_2"] = np.sqrt(
-                df[f"{view}_x_2_diff1"] ** 2 + df[f"{view}_y_2_diff1"] ** 2)
-            df[f"{view}_move_helmet"] = df[[f"{view}_move_helmet_1", f"{view}_move_helmet_2"]].mean(
-                axis=1)
-        df["move_helmet"] = df[["Endzone_move_helmet", "Sideline_move_helmet"]].mean(axis=1)
+        if self.include_helmet_info:
+            for view in ["Endzone", "Sideline"]:
+                df[f"{view}_move_helmet_1"] = np.sqrt(
+                    df[f"{view}_x_1_diff1"] ** 2 + df[f"{view}_y_1_diff1"] ** 2)
+                df[f"{view}_move_helmet_2"] = np.sqrt(
+                    df[f"{view}_x_2_diff1"] ** 2 + df[f"{view}_y_2_diff1"] ** 2)
+                df[f"{view}_move_helmet"] = df[[f"{view}_move_helmet_1", f"{view}_move_helmet_2"]].mean(
+                    axis=1)
+            df["move_helmet"] = df[["Endzone_move_helmet", "Sideline_move_helmet"]].mean(axis=1)
 
-        lag_columns2 = [
-            "move_helmet",
-            "Endzone_move_helmet_1", "Endzone_move_helmet_2",
-            "Sideline_move_helmet_1", "Sideline_move_helmet_2",
-        ]
+            lag_columns2 = [
+                "move_helmet",
+                "Endzone_move_helmet_1", "Endzone_move_helmet_2",
+                "Sideline_move_helmet_1", "Sideline_move_helmet_2",
+            ]
 
-        for lag in tqdm.tqdm([1, 5, 10, 20, 60, -1, -5, -10, -20, -60]):
-            lag_cols = [f"{lag_column}_lag{lag}" for lag_column in lag_columns2]
-            df[lag_cols] = df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])[lag_columns2].shift(lag)
-            diff_cols = [f"{lag_column}_diff{lag}" for lag_column in lag_columns2]
-            df[diff_cols] = df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])[lag_columns2].diff(lag)
+            for lag in tqdm.tqdm([1, 3, 5, 10, 20, 60, -1, -3, -5, -10, -20, -60]):
+                lag_cols = [f"{lag_column}_lag{lag}" for lag_column in lag_columns2]
+                df[lag_cols] = df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])[lag_columns2].shift(lag)
+                diff_cols = [f"{lag_column}_diff{lag}" for lag_column in lag_columns2]
+                df[diff_cols] = df.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])[lag_columns2].diff(lag)
 
         agg_cols = [
             "distance",
-            "Endzone_move_helmet_1", "Endzone_move_helmet_2",
-            "Sideline_move_helmet_1", "Sideline_move_helmet_2",
-            "Endzone_move_helmet_1_lag1", "Endzone_move_helmet_2_lag1",
-            "Sideline_move_helmet_1_lag1", "Sideline_move_helmet_2_lag1",
-            "Endzone_move_helmet_1_lag5", "Endzone_move_helmet_2_lag5",
-            "Sideline_move_helmet_1_lag5", "Sideline_move_helmet_2_lag5",
-            "move_helmet", "move_sensor",
+            "move_sensor",
             "distance_lag1", "distance_lag20",
             "move_sensor_lag1", "move_sensor_lag20",
+            "distance_lag-1", "distance_lag-20",
+            "move_sensor_lag-1", "move_sensor_lag-20",
             "distance_top1",
             "distance_top3",
             "distance_top5",
             "distance_top7",
+            "diff_from_distance_top1",
+            "diff_from_distance_top3",
+            "diff_from_distance_top5",
+            "diff_from_distance_top7",
         ]
+        if self.include_helmet_info:
+            agg_cols += [
+                "Endzone_move_helmet_1", "Endzone_move_helmet_2",
+                "Sideline_move_helmet_1", "Sideline_move_helmet_2",
+                "Endzone_move_helmet_1_lag1", "Endzone_move_helmet_2_lag1",
+                "Sideline_move_helmet_1_lag1", "Sideline_move_helmet_2_lag1",
+                "Endzone_move_helmet_1_lag5", "Endzone_move_helmet_2_lag5",
+                "Sideline_move_helmet_1_lag5", "Sideline_move_helmet_2_lag5",
+                "move_helmet",
+            ]
 
         agg_cols += player_features
 
         agg_cols += [f"{f}_lag1" for f in player_features]
         agg_cols += [f"{f}_lag5" for f in player_features]
+        agg_cols += [f"{f}_lag-1" for f in player_features]
+        agg_cols += [f"{f}_lag-5" for f in player_features]
         self.logger.info("aggregate features")
         for agg_col in tqdm.tqdm(agg_cols):
             col_name = f"{agg_col}_groupby_gameplay_mean"
@@ -355,12 +384,19 @@ class Model:
         agg_col2 = [
             "distance",
             "move_sensor",
-            "distance_helmet_mean",
             "distance_top1",
             "distance_top3",
             "distance_top5",
             "distance_top7",
+            "diff_from_distance_top1",
+            "diff_from_distance_top3",
+            "diff_from_distance_top5",
+            "diff_from_distance_top7",
         ]
+        if self.include_helmet_info:
+            agg_col2 += [
+                "distance_helmet_mean",
+            ]
 
         for agg_col in tqdm.tqdm(agg_col2):
             col_name = f"{agg_col}_groupby_is_same_team"
@@ -373,29 +409,43 @@ class Model:
             "distance_1",
             "speed_1",
             "acceleration_1",
-            "move_helmet",
-            "move_helmet_lag1",
-            "move_helmet_lag5",
-            "Endzone_move_helmet_1",
-            "Sideline_move_helmet_1",
-            "Endzone_move_helmet_1_lag1",
-            "Sideline_move_helmet_1_lag1",
-            "Endzone_move_helmet_1_lag5",
-            "Sideline_move_helmet_1_lag5",
             "distance_1_lag1",
             "distance_1_lag5",
             "distance_1_lag10",
+            "distance_1_lag-1",
+            "distance_1_lag-5",
+            "distance_1_lag-10",
             "speed_1_lag1",
             "speed_1_lag5",
             "speed_1_lag10",
+            "speed_1_lag-1",
+            "speed_1_lag-5",
+            "speed_1_lag-10",
             "distance_top1",
             "distance_top3",
             "distance_top5",
             "distance_top7",
+            "diff_from_distance_top1",
+            "diff_from_distance_top3",
+            "diff_from_distance_top5",
+            "diff_from_distance_top7",
         ]
+        if self.include_helmet_info:
+            agg_col3 += [
+                "move_helmet",
+                "move_helmet_lag1",
+                "move_helmet_lag5",
+                "move_helmet_lag-1",
+                "move_helmet_lag-5",
+                "Endzone_move_helmet_1",
+                "Sideline_move_helmet_1",
+                "Endzone_move_helmet_1_lag1",
+                "Sideline_move_helmet_1_lag1",
+                "Endzone_move_helmet_1_lag5",
+                "Sideline_move_helmet_1_lag5",
+            ]
         for groupby_col in ["is_g", "n_player_distance_all_in_3",
-                            "n_player_distance_sameteam_in_3", "n_player_distance_notsameteam_in_3",
-                            "n_player_distance_all_in_1", "n_player_distance_all_in_5", "n_player_distance_all_in_10"]:
+                            "n_player_distance_sameteam_in_3", "n_player_distance_notsameteam_in_3",]:
             for agg_col in tqdm.tqdm(agg_col3):
                 col_name = f"{agg_col}_groupby_{groupby_col}"
                 if not inference:
@@ -422,9 +472,10 @@ class Model:
 
     def train(self,
               df: pd.DataFrame,
-              df_label: pd.DataFrame = None):
+              df_label: pd.DataFrame = None,
+              use_half_data: bool = False):
 
-        gkfold = GroupKFold(5)
+        gkfold = GroupKFold(3)
         df_fe = self.feature_engineering(df, inference=False)
         if df_label is None:
             if self.debug:
@@ -454,53 +505,32 @@ class Model:
 
         if self.use_features is None:
             self.use_features = df_train.drop(self.drop_columns + ["contact"], axis=1).columns
+        if use_half_data:
+            df_train = df_train.iloc[::2].reset_index(drop=True)
+        dataset_train = lgb.Dataset(df_train[self.use_features], label=df_train["contact"])
+        dataset_val = lgb.Dataset(df_val[self.use_features], label=df_val["contact"])
+        del df_train; gc.collect()
 
         lgb.register_logger(self.logger)
         mlflow.set_tracking_uri('../../mlruns/')
 
         with mlflow.start_run(experiment_id=1, run_name=self.exp_name):
+            self.model = lgb.train(
+                copy.copy(self.params),
+                dataset_train,
+                valid_sets=[dataset_train, dataset_val],
+                verbose_eval=100,
+            )
 
-            if self.model_name == "lightgbm":
-                dataset_train = lgb.Dataset(df_train[self.use_features], label=df_train["contact"])
-                dataset_val = lgb.Dataset(df_val[self.use_features], label=df_val["contact"])
-                del df_train;
-                gc.collect()
+            self.model.save_model(self.model_dir)
 
-                self.model = lgb.train(
-                    copy.copy(self.params),
-                    dataset_train,
-                    valid_sets=[dataset_train, dataset_val],
-                    verbose_eval=100,
-                )
-
-                pd.DataFrame({
-                    "col": self.model.feature_name(),
-                    "imp": self.model.feature_importance("gain") / self.model.feature_importance("gain").sum()
-                }).sort_values("imp", ascending=False).to_csv(f"{self.output_dir}/feature_importance.csv", index=False)
-
-                self.model.save_model(self.model_dir)
-
-                # inference
-                self.model = lgb.Booster(model_file=self.model_dir)
-                if self.fast_mode:
-                    pred = self.model.predict(df_val[self.use_features])
-                    contact_id = df_val["contact_id"].values
-                else:
-                    pred, contact_id = self.predict(df_test)
-
-            elif self.model_name == "catboost":
-                self.model = CatBoost(self.params)
-                train_data = Pool(df_train[self.use_features], label=df_train["contact"])
-                valid_data = Pool(df_val[self.use_features], label=df_val["contact"])
-                self.model.fit(train_data,
-                               eval_set=valid_data,
-                               verbose_eval=100,
-                               use_best_model=True)
-                if self.fast_mode:
-                    pred = self.model.predict(df_val[self.use_features], prediction_type='Probability')[:, 1]
-                    contact_id = df_val["contact_id"].values
-                else:
-                    pred, contact_id = self.predict(df_test)
+            # inference
+            self.model = lgb.Booster(model_file=self.model_dir)
+            if self.fast_mode:
+                pred = self.model.predict(df_val[self.model.feature_name()])
+                contact_id = df_val["contact_id"].values
+            else:
+                pred, contact_id = self.predict(df_test)
 
             df_pred = pd.DataFrame({
                 "contact_id": contact_id,
@@ -534,6 +564,10 @@ class Model:
             mlflow.log_metric("best_score", best_score)
 
             pd.DataFrame({
+                "col": self.model.feature_name(),
+                "imp": self.model.feature_importance("gain") / self.model.feature_importance("gain").sum()
+            }).sort_values("imp", ascending=False).to_csv(f"{self.output_dir}/feature_importance.csv", index=False)
+            pd.DataFrame({
                 "contact_id": df_merge["contact_id"].values,
                 "score": pred
             }).to_csv(f"{self.output_dir}/pred.csv", index=False)
@@ -558,65 +592,36 @@ def main():
         'metrics': 'auc',
         'num_leaves': 128,
         'max_depth': -1,
-        'bagging_fraction': 0.7,  # 0.5,
+        'bagging_fraction': 0.9,  # 0.5,
         'feature_fraction': 0.3,
         'bagging_seed': 0,
-        'reg_alpha': 1,
+        'reg_alpha': 10,
         'reg_lambda': 5,
-        'min_data_in_leaf': 100,
+        'min_data_in_leaf': 10000,
         'random_state': 0,
         'verbosity': -1,
         "n_estimators": 20000,
         "early_stopping_rounds": 100,
         "learning_rate": 0.01,
-        "n_jobs": 32
+        "n_jobs": 28
     }
-    # use_features = pd.read_csv("../../output/lgbm/exp013/20230122164447/feature_importance.csv")["col"].values[:400]
-    use_features = pd.read_csv(
-        "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
-    )["col"].values[:500]
+    use_features = pd.read_csv("../../output/lgbm/exp019/20230205212033/feature_importance.csv")["col"].values[:500]
 
-    model = Model(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
-                  params=params, use_features=use_features)
+    model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
+                      params=params, use_features=use_features)
     model.train(df)
     del model.logger
-    #
-    # for depth in [8]:
-    #     output_dir = f"../../output/lgbm/{os.path.basename(__file__).replace('.py', '')}/{dt.now().strftime('%Y%m%d%H%M%S')}"
-    #     os.makedirs(output_dir, exist_ok=True)
-    #     shutil.copy(__file__, output_dir)
-    #     logger = get_logger(output_dir)
-    #     df = pd.read_feather("../../output/preprocess/master_data_v4/gps.feather")
-    #     if debug:
-    #         df = df.head(300000)
-    #     params = {
-    #         'n_estimators': 12000,
-    #         'learning_rate': 0.01,
-    #         'eval_metric': 'AUC',
-    #         'loss_function': 'Logloss',
-    #         'random_seed': 0,
-    #         'metric_period': 50,
-    #         'od_wait': 400,
-    #         'task_type': 'GPU',
-    #         'max_depth': depth,
-    #         "verbose": 100
-    #     }
-    #
-    #     model = Model(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
-    #                   params=params, use_features=use_features, model_name="catboost")
-    #     model.train(df)
-    #     del model.logger
-    #
-    # with open(f"{output_dir}/model.pickle", "wb") as f:
-    #     pickle.dump(model, f)
-    #
+
+    with open(f"{output_dir}/model.pickle", "wb") as f:
+        pickle.dump(model, f)
+
     # for _ in range(1000):
     #     output_dir = f"../../output/lgbm/{os.path.basename(__file__).replace('.py', '')}/{dt.now().strftime('%Y%m%d%H%M%S')}"
     #     os.makedirs(output_dir, exist_ok=True)
     #     shutil.copy(__file__, output_dir)
     #     logger = get_logger(output_dir)
     #
-    #     df = pd.read_feather("../../output/preprocess/master_data_v4/gps.feather")
+    #     df = pd.read_feather("../../output/preprocess/master_data_v3/gps.feather")
     #     if debug:
     #         df = df.head(300000)
     #
@@ -625,23 +630,20 @@ def main():
     #         'metrics': 'auc',
     #         'num_leaves': np.random.choice([16, 32, 64, 128, 256]),
     #         'max_depth': -1,
-    #         'bagging_fraction': np.random.choice([0.5, 0.7, 0.9]),  # 0.5,
-    #         'feature_fraction': np.random.choice([0.05, 0.1, 0.3, 0.5, 0.7]),
+    #         'bagging_fraction': np.random.choice([0.7, 0.9]),  # 0.5,
+    #         'feature_fraction': np.random.choice([0.1, 0.3, 0.5, 0.7, 0.9]),
     #         'bagging_seed': 0,
-    #         'reg_alpha': np.random.choice([0.5, 1, 3, 5, 10]),
-    #         'reg_lambda': np.random.choice([0.5, 1, 3, 5, 10]),
+    #         'reg_alpha': np.random.choice([0, 0.1, 0.5, 1, 3, 5, 10]),
+    #         'reg_lambda': np.random.choice([0, 0.1, 0.5, 1, 3, 5, 10]),
     #         'min_data_in_leaf': np.random.choice([1, 10, 50, 100, 500, 1000, 5000, 10000]),
     #         'random_state': 0,
     #         'verbosity': -1,
     #         "n_estimators": 20000,
     #         "early_stopping_rounds": 100,
     #         "learning_rate": 0.1,
-    #         "n_jobs": 32
+    #         "n_jobs": 28
     #     }
-    #     use_features = pd.read_csv(
-    #         "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
-    #     )["col"].values[:500]
-    #     model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp017", debug=debug, fast_mode=True,
+    #     model = LGBMModel(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
     #                       params=params, use_features=use_features)
     #     model.train(df)
 

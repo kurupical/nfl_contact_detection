@@ -29,15 +29,21 @@ pd.set_option("max_column", 200)
 
 debug = False
 
-def get_near_player(df_distance, w_df, distance_matrix, name):
-    for distance_th in [1, 3, 5, 7.5, 10, 15]:
-        df_distance[f"n_player_distance_{name}_in_{distance_th}"] = (distance_matrix < distance_th).sum(axis=1)
+def get_near_player(df_distance, w_df, distance_matrix, name, distance_col):
+
+    if distance_col == "distance":
+        for distance_th in [1, 3, 5, 7.5, 10, 15]:
+            df_distance[f"n_player_{distance_col}_{name}_in_{distance_th}"] = (distance_matrix < distance_th).sum(axis=1)
+    else:
+        for distance_th in [100, 300, 500, 1000, 2000, 4000]:
+            df_distance[f"n_player_{distance_col}_{name}_in_{distance_th}"] = (distance_matrix < distance_th).sum(axis=1)
+
     for top_n in [1, 3, 5, 7]:
         if len(distance_matrix) <= top_n:
             continue
-        col_name = f"distance_top{top_n}"
+        col_name = f"{distance_col}_top{top_n}"
         df_distance[col_name] = distance_matrix[:, top_n]
-        df_distance[f"diff_from_{col_name}"] = w_df["distance"].values - df_distance[col_name].values
+        df_distance[f"diff_from_{col_name}"] = w_df[distance_col].values - df_distance[col_name].values
     return df_distance
 
 
@@ -189,25 +195,31 @@ class Model:
 
         self.logger.info("nearest_n_player")
 
+        for view in ["Endzone", "Sideline"]:
+            df[f"{view}_distance_helmet"] = np.sqrt(
+                (df[f"{view}_x_1"].values - df[f"{view}_x_2"]) ** 2 + \
+                (df[f"{view}_y_1"].values - df[f"{view}_y_2"]) ** 2
+            )
+        df[f"distance_helmet_mean"] = df[["Endzone_distance_helmet", "Sideline_distance_helmet"]].mean(axis=1)
+        df[f"distance_helmet_min"] = df[["Endzone_distance_helmet", "Sideline_distance_helmet"]].min(axis=1)
+        df[f"distance_helmet_max"] = df[["Endzone_distance_helmet", "Sideline_distance_helmet"]].max(axis=1)
+
         df_distances = []
         for key, w_df in tqdm.tqdm(df.drop_duplicates(["game_play", "nfl_player_id_1", "step"]).groupby(["game_play", "step"])):
-            if np.isnan(w_df["x_position_1"].iloc[0]):
-                continue
             df_distance = w_df[["game_play", "nfl_player_id_1", "step"]]
-            distance_matrix_org = euclidean_distances(w_df[["x_position_1", "y_position_1"]].values)
-            distance_matrix = distance_matrix_org.copy()
-            distance_matrix.sort(axis=1)
-            df_distance = get_near_player(df_distance, w_df, distance_matrix, name="all")
-
-            distance_matrix = distance_matrix_org.copy()
-            distance_matrix *= w_df["team_1"].values.reshape(-1, 1) == w_df["team_1"].values.reshape(1, -1)
-            distance_matrix[distance_matrix==0] = 999
-            df_distance = get_near_player(df_distance, w_df, distance_matrix, name="sameteam")
-
-            distance_matrix = distance_matrix_org.copy()
-            distance_matrix *= w_df["team_1"].values.reshape(-1, 1) == w_df["team_1"].values.reshape(1, -1)
-            distance_matrix[distance_matrix==1] = 999
-            df_distance = get_near_player(df_distance, w_df, distance_matrix, name="notsameteam")
+            for distance_col in ["distance", "Endzone_distance_helmet", "Sideline_distance_helmet"]:
+                if np.isnan(w_df["x_position_1"].iloc[0]):
+                    continue
+                if distance_col == "distance":
+                    distance_matrix_org = euclidean_distances(w_df[["x_position_1", "y_position_1"]].values)
+                if distance_col == "Endzone_distance_helmet":
+                    distance_matrix_org = euclidean_distances(w_df[["Endzone_x_1", "Endzone_y_1"]].fillna(0).values)
+                if distance_col == "Sideline_distance_helmet":
+                    distance_matrix_org = euclidean_distances(w_df[["Sideline_x_1", "Sideline_y_1"]].fillna(0).values)
+                distance_matrix_org[distance_matrix_org==0] = 99999
+                distance_matrix = distance_matrix_org.copy()
+                distance_matrix.sort(axis=1)
+                df_distance = get_near_player(df_distance, w_df, distance_matrix, name="all", distance_col=distance_col)
 
             df_distances.append(df_distance)
         df_distances = pd.concat(df_distances)
@@ -245,15 +257,6 @@ class Model:
             (df["x_position_1"].values - df["x_position_2"]) ** 2 + \
             (df["y_position_1"].values - df["y_position_2"]) ** 2
         )
-
-        for view in ["Endzone", "Sideline"]:
-            df[f"{view}_distance_helmet"] = np.sqrt(
-                (df[f"{view}_x_1"].values - df[f"{view}_x_2"]) ** 2 + \
-                (df[f"{view}_y_1"].values - df[f"{view}_y_2"]) ** 2
-            )
-        df[f"distance_helmet_mean"] = df[["Endzone_distance_helmet", "Sideline_distance_helmet"]].mean(axis=1)
-        df[f"distance_helmet_min"] = df[["Endzone_distance_helmet", "Sideline_distance_helmet"]].min(axis=1)
-        df[f"distance_helmet_max"] = df[["Endzone_distance_helmet", "Sideline_distance_helmet"]].max(axis=1)
 
         df["move_sensor"] = df["distance_1"] + df["distance_2"]
 
@@ -394,7 +397,6 @@ class Model:
             "distance_top7",
         ]
         for groupby_col in ["is_g", "n_player_distance_all_in_3",
-                            "n_player_distance_sameteam_in_3", "n_player_distance_notsameteam_in_3",
                             "n_player_distance_all_in_1", "n_player_distance_all_in_5", "n_player_distance_all_in_10"]:
             for agg_col in tqdm.tqdm(agg_col3):
                 col_name = f"{agg_col}_groupby_{groupby_col}"
@@ -422,7 +424,9 @@ class Model:
 
     def train(self,
               df: pd.DataFrame,
-              df_label: pd.DataFrame = None):
+              df_label: pd.DataFrame = None,
+              fold: int = 0,
+              use_half_data: bool = False):
 
         gkfold = GroupKFold(5)
         df_fe = self.feature_engineering(df, inference=False)
@@ -435,7 +439,9 @@ class Model:
 
         self.logger.info((df_fe.isnull().sum() / len(df_fe)).sort_values())
 
-        for train_idx, val_idx in gkfold.split(df_label, groups=df_label["game_key"].values):
+        for i, (train_idx, val_idx) in enumerate(gkfold.split(df_label, groups=df_label["game_key"].values)):
+            if i != fold:
+                continue
             df_label_train = df_label.iloc[train_idx]
             df_label_val = df_label.iloc[val_idx]
             df_train = df_fe[df_fe["game_key"].isin(df_label_train["game_key"].values)]
@@ -454,6 +460,8 @@ class Model:
 
         if self.use_features is None:
             self.use_features = df_train.drop(self.drop_columns + ["contact"], axis=1).columns
+        if use_half_data:
+            df_train = df_train.iloc[::2].reset_index(drop=True)
 
         lgb.register_logger(self.logger)
         mlflow.set_tracking_uri('../../mlruns/')
@@ -572,12 +580,12 @@ def main():
         "n_jobs": 32
     }
     # use_features = pd.read_csv("../../output/lgbm/exp013/20230122164447/feature_importance.csv")["col"].values[:400]
-    use_features = pd.read_csv(
-        "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
-    )["col"].values[:500]
+    # use_features = pd.read_csv(
+    #     "../../output/lgbm/exp017/20230126084303/feature_importance.csv"
+    # )["col"].values[:500]
 
     model = Model(output_dir=output_dir, logger=logger, exp_name="exp006_bugfix", debug=debug, fast_mode=True,
-                  params=params, use_features=use_features)
+                  params=params)
     model.train(df)
     del model.logger
     #
@@ -606,7 +614,7 @@ def main():
     #                   params=params, use_features=use_features, model_name="catboost")
     #     model.train(df)
     #     del model.logger
-    #
+
     # with open(f"{output_dir}/model.pickle", "wb") as f:
     #     pickle.dump(model, f)
     #

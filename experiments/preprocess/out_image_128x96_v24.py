@@ -10,7 +10,7 @@ AWAY = (0, 78, 255)
 HOME = (255, 255, 255)
 PLAYER = (255, 0, 0)
 output_size = (128, 96)
-output_dir = f"../../../work/images_{output_size[0]}x{output_size[1]}_v21"
+output_dir = f"../../../work/images_{output_size[0]}x{output_size[1]}_v24"
 traintest = "train"
 
 bbox_left_ratio = 4.5
@@ -18,16 +18,8 @@ bbox_right_ratio = 4.5
 bbox_top_ratio = 4.5
 bbox_down_ratio = 2.25
 
-def load_video(video_path):
-    vidcap = cv2.VideoCapture(video_path)
-    frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    imgs = []
-    for _ in range(frame_count):
-        it_worked, img = vidcap.read()
-        imgs.append(img)
-    imgs = np.stack(imgs)
-    return imgs
+interval = 3
+n_frames = 31
 
 def join_helmets_contact(game_play, labels, helmets, meta, view="Sideline", fps=59.94):
     """
@@ -57,7 +49,7 @@ def join_helmets_contact(game_play, labels, helmets, meta, view="Sideline", fps=
     keys = ["frame", "game_play", "datetime_ngs", "view"]
     gp = pd.merge(
         gp_labs,
-        gp_helms.drop("datetime", axis=1).rename(columns={col: f"{col}_1" for col in gp_helms.columns if col not in keys}),
+        gp_helms.rename(columns={col: f"{col}_1" for col in gp_helms.columns if col not in keys}),
         how="left",
     )
     gp = pd.merge(
@@ -112,42 +104,52 @@ def main():
         df_["nfl_player_id"] = nfl_player_id
         df_["view"] = view
         df_["team"] = team
-        # for col in ["x", "y", "left", "top", "width", "height"]:
-        #     df_[col] = df_[col].interpolate(limit=5, limit_area="inside")
+        for col in ["x", "y", "left", "top", "width", "height"]:
+            df_[col] = df_[col].interpolate(limit=10, limit_area="inside")
         df_helmets_concat.append(df_)
 
     df_helmets = pd.concat(df_helmets_concat)
 
-    game_plays = df_labels["game_play"].drop_duplicates().values
+    df_tracking = df_tracking[df_tracking["distance"] < 1.75]
+    for col in ["x", "y", "width", "height"]:
+        df_tracking[col] = df_tracking[[f"{col}_1", f"{col}_2"]].mean(axis=1)
+    df_tracking["bbox_size"] = df_tracking[["width", "height"]].mean(axis=1)
 
-    for i, game_play in enumerate(tqdm.tqdm(game_plays)):
+    for key, df_tracking_ in tqdm.tqdm(df_tracking.groupby(["game_play", "view"])):
+        game_play, view = key[0], key[1]
         gp = join_helmets_contact(game_play, df_labels, df_helmets, df_meta)
-        for col in ["x", "y", "width", "height"]:
-            gp[col] = gp[[f"{col}_1", f"{col}_2"]].mean(axis=1)
-        gp["bbox_size"] = gp[["width", "height"]].mean(axis=1)
-        for view in ["Endzone", "Sideline"]:
-            gp_ = gp[gp["view"] == view]
 
-            data_dict = {}
-            for key, w_df in gp_.groupby(["nfl_player_id_1", "nfl_player_id_2"]):
-                w_df = w_df.set_index("frame")
-                data_dict[key] = w_df
+        interval_dict = {}
+        for i in range(len(df_tracking_)):
+            series = df_tracking_.iloc[i]
+            key = (series["frame"], series["nfl_player_id_1"], series["nfl_player_id_2"])
+            interval_dict[key] = series
 
-            bbox_dict = {}
-            for key, w_df in gp_.drop_duplicates(["frame", "nfl_player_id_1"]).groupby("frame"):
-                bbox_dict[key] = w_df[["left_1", "width_1", "top_1", "height_1"]].dropna().values.astype(int)
+        gp_ = gp[gp["view"] == view]
 
-            frames = gp_["frame"].drop_duplicates().values
-            video_path = f"{base_dir}/{traintest}/{game_play}_{view}.mp4"
-            # imgs = load_video(video_path)
-            vidcap = cv2.VideoCapture(video_path)
-            frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-            for frame in range(frame_count):
-                it_worked, img_ = vidcap.read()
+        data_dict = {}
+        for key, w_df in gp_.groupby(["nfl_player_id_1", "nfl_player_id_2"]):
+            w_df = w_df.set_index("frame")
+            data_dict[key] = w_df
 
-                if frame not in frames:
-                    continue
+        bbox_dict = {}
+        for key, w_df in gp_.drop_duplicates(["frame", "nfl_player_id_1"]).groupby("frame"):
+            bbox_dict[key] = w_df[["left_1", "width_1", "top_1", "height_1"]].dropna().values.astype(int)
 
+        frames_gp = gp_["frame"].drop_duplicates().values
+        frames_tracking = df_tracking_["frame"].drop_duplicates().values
+        video_path = f"{base_dir}/{traintest}/{game_play}_{view}.mp4"
+        vidcap = cv2.VideoCapture(video_path)
+        frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        imgs = []
+        for frame in range(frame_count):
+
+            center_frame = frame - (n_frames // 2) * interval
+            it_worked, img_ = vidcap.read()
+            if frame not in frames_gp:
+                continue
+            if frame % 3 == 0:
                 img_filter = img_.copy()
                 for bbox in bbox_dict[frame]:
                     box_left = bbox[0]
@@ -162,60 +164,82 @@ def main():
                         thickness=-1,
                     )
                 img_ = cv2.addWeighted(src1=img_, alpha=0.75, src2=img_filter, beta=0.25, gamma=0)
-                for key, w_df in data_dict.items():
-                    img = img_.copy()
+                if len(imgs) == 0:
+                    imgs = img_[np.newaxis]
+                else:
+                    imgs = np.concatenate([imgs, img_[np.newaxis]], axis=0)
 
-                    if not frame in w_df.index:
-                        continue
-                    series = w_df.loc[frame]
-                    if np.isnan(series["x"]):
-                        continue
-                    left = int(series["x"] - series["bbox_size"] * bbox_left_ratio)
-                    right = int(series["x"] + series["bbox_size"] * bbox_right_ratio)
-                    top = int(series["y"] + series["bbox_size"] * bbox_top_ratio)
-                    down = int(series["y"] - series["bbox_size"] * bbox_down_ratio)
+            if len(imgs) < n_frames:
+                continue
+            if len(imgs) > n_frames:
+                imgs = imgs[1:]
 
-                    left = max(0, left)
-                    down = max(0, down)
+            if center_frame not in frames_tracking:
+                continue
 
+            for key, w_df in data_dict.items():
+                id_1, id_2 = key[0], key[1]
+
+                if (center_frame, id_1, id_2) not in interval_dict:
+                    continue
+                else:
+                    series = interval_dict[(center_frame, id_1, id_2)]
+                step = series["step"]
+                if np.isnan(series["x"]):
+                    continue
+                left = int(series["x"] - series["bbox_size"] * bbox_left_ratio)
+                right = int(series["x"] + series["bbox_size"] * bbox_right_ratio)
+                top = int(series["y"] + series["bbox_size"] * bbox_top_ratio)
+                down = int(series["y"] - series["bbox_size"] * bbox_down_ratio)
+
+                left = max(0, left)
+                down = max(0, down)
+                
+                for i, img in enumerate(imgs):
+                    # frame_index = i - n_frames // 2
+                    frame_ = frame - (n_frames - i - 1) * interval
                     img = img[down:top, left:right]
                     img_filter = img.copy()
-                    for player_id in [1, 2]:
-                        if series[f"nfl_player_id_{player_id}"] == "G":
-                            continue
-                        if np.isnan(series[f"left_{player_id}"]):
-                            continue
 
-                        if series[f"nfl_player_id_2"] == "G":
-                            box_color = CONTACT
-                        elif series["team_1"] != series["team_2"]:
-                            box_color = AWAY
-                        else:
-                            box_color = HOME
-                        box_left = max(0, int(series[f"left_{player_id}"]) - left)
-                        box_right = max(min(img.shape[1], int(series[f"left_{player_id}"] + series[f"width_{player_id}"]) - left), 0)
-                        box_top = max(0, int(series[f"top_{player_id}"]) - down)
-                        box_down = max(min(img.shape[0], int(series[f"top_{player_id}"] + series[f"height_{player_id}"]) - down), 0)
-                        cv2.rectangle(
-                            img_filter,
-                            (box_left, box_top),
-                            (box_right, box_down),
-                            box_color,
-                            thickness=-1,
-                        )
-                        # img_filter[
-                        #     int(series[f"top_{player_id}"]):int(series[f"top_{player_id}"] + series[f"height_{player_id}"])+1,
-                        #     int(series[f"left_{player_id}"]):int(series[f"left_{player_id}"] + series[f"width_{player_id}"])+1,
-                        # ] += np.array(box_color, dtype=np.uint8)
+                    if frame_ in w_df.index:
+                        series = w_df.loc[frame_]
+                        for player_id in [1, 2]:
+                            if series[f"nfl_player_id_{player_id}"] == "G":
+                                continue
+                            if np.isnan(series[f"left_{player_id}"]):
+                                continue
 
-                    img = cv2.addWeighted(src1=img, alpha=0.5, src2=img_filter, beta=0.5, gamma=0)
-                    # img = (img*0.7 + img_filter*0.3).astype(np.uint8)
+                            if series[f"nfl_player_id_2"] == "G":
+                                box_color = CONTACT
+                            elif series["team_1"] != series["team_2"]:
+                                box_color = AWAY
+                            else:
+                                box_color = HOME
+                            box_left = max(0, int(series[f"left_{player_id}"]) - left)
+                            box_right = max(min(img.shape[1], int(series[f"left_{player_id}"] + series[f"width_{player_id}"]) - left), 0)
+                            box_top = max(0, int(series[f"top_{player_id}"]) - down)
+                            box_down = max(min(img.shape[0], int(series[f"top_{player_id}"] + series[f"height_{player_id}"]) - down), 0)
+                            cv2.rectangle(
+                                img_filter,
+                                (box_left, box_top),
+                                (box_right, box_down),
+                                box_color,
+                                thickness=-1,
+                            )
+                            # img_filter[
+                            #     int(series[f"top_{player_id}"]):int(series[f"top_{player_id}"] + series[f"height_{player_id}"])+1,
+                            #     int(series[f"left_{player_id}"]):int(series[f"left_{player_id}"] + series[f"width_{player_id}"])+1,
+                            # ] += np.array(box_color, dtype=np.uint8)
+    
+                        img = cv2.addWeighted(src1=img, alpha=0.5, src2=img_filter, beta=0.5, gamma=0)
+                        # img = (img*0.7 + img_filter*0.3).astype(np.uint8)
 
-                    img = cv2.resize(img, dsize=output_size)
-                    out_fname = f"{output_dir}/{game_play}/{view}/{key[0]}_{key[1]}_{frame}.jpg"
-                    os.makedirs(os.path.dirname(out_fname), exist_ok=True)
-                    cv2.imwrite(out_fname, img)
-            vidcap.release()
+                        img = cv2.resize(img, dsize=output_size)
+
+                        out_fname = f"{output_dir}/{game_play}/{view}/{key[0]}_{key[1]}_{step}_{str(i).zfill(3)}.jpg"
+                        os.makedirs(os.path.dirname(out_fname), exist_ok=True)
+                        cv2.imwrite(out_fname, img)
+        vidcap.release()
 
 
 if __name__ == "__main__":
