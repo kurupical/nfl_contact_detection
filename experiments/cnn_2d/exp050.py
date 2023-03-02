@@ -1511,11 +1511,11 @@ class Model2DTo1D(nn.Module):
         elif self.config.pooling == "maxpool":
             x = F.adaptive_max_pool1d(x, 1).squeeze(2)
 
-        x_endzone = self._forward_g_contact(self.fc_endzone_g, self.fc_endzone_contact, x[::2], is_g)
-        x_sideline = self._forward_g_contact(self.fc_sideline_g, self.fc_sideline_contact, x[1::2], is_g)
+        x_endzone = self._forward_g_contact(self.fc_endzone_g, self.fc_endzone_g, x[::2], is_g)
+        x_sideline = self._forward_g_contact(self.fc_sideline_g, self.fc_sideline_g, x[1::2], is_g)
         if self.config.fc_sideend == "concat":
             x = x.reshape(bs, -1)
-            x = self._forward_g_contact(self.fc_g, self.fc_contact, x, is_g)
+            x = self._forward_g_contact(self.fc_g, self.fc_g, x, is_g)
         return x, x_endzone, x_sideline
 
     def forward_features(self, x):
@@ -1578,11 +1578,11 @@ class Model2DTo3D(nn.Module):
         if len(x.shape) == 5:
             x = F.adaptive_avg_pool3d(x, 1).squeeze(4).squeeze(3).squeeze(2)
 
-        x_endzone = self._forward_g_contact(self.fc_endzone_g, self.fc_endzone_contact, x[::2], is_g)
-        x_sideline = self._forward_g_contact(self.fc_sideline_g, self.fc_sideline_contact, x[1::2], is_g)
+        x_endzone = self._forward_g_contact(self.fc_endzone_g, self.fc_endzone_g, x[::2], is_g)
+        x_sideline = self._forward_g_contact(self.fc_sideline_g, self.fc_sideline_g, x[1::2], is_g)
         if self.config.fc_sideend == "concat":
             x = x.reshape(bs, -1)
-            x = self._forward_g_contact(self.fc_g, self.fc_contact, x, is_g)
+            x = self._forward_g_contact(self.fc_g, self.fc_g, x, is_g)
         return x, x_endzone, x_sideline
 
     def forward_features(self, x):
@@ -1635,10 +1635,10 @@ class Model2D(nn.Module):
         x_endzone = None
         x_sideline = None
         x = self.cnn_2d(x)  # (bs*n_view, features)
-        x_endzone = self._forward_g_contact(self.fc_endzone_g, self.fc_endzone_contact, x[::2], is_g)
-        x_sideline = self._forward_g_contact(self.fc_sideline_g, self.fc_sideline_contact, x[1::2], is_g)
+        x_endzone = self._forward_g_contact(self.fc_endzone_g, self.fc_endzone_g, x[::2], is_g)
+        x_sideline = self._forward_g_contact(self.fc_sideline_g, self.fc_sideline_g, x[1::2], is_g)
         x = torch.cat([x[::2], x[1::2]], dim=1)  # (bs, n_view*features)
-        x = self._forward_g_contact(self.fc_g, self.fc_contact, x, is_g)
+        x = self._forward_g_contact(self.fc_g, self.fc_endzone_g, x, is_g)
 
         return x, x_endzone, x_sideline
 
@@ -1765,12 +1765,7 @@ class Model2p5DTo3D(nn.Module):
             self.ln = nn.LayerNorm(self.config.feature_hidden_size)
 
     def _forward_g_contact(self, model_g, model_contact, x, is_g):
-        x_contact = model_contact(x)  # (bs, n_predict_frames)
-        x_g = model_g(x)  # (bs, n_predict_frames)
-
-        not_is_g = (is_g == 0)
-        x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
-        return x
+        return model_contact(x)
 
     def _forward_sep_sideend(self, x, is_g, feature):
         bs, _, seq_len, W, H = x.shape  # C = 1
@@ -1961,12 +1956,7 @@ class Model3D(nn.Module):
             self.ln = nn.LayerNorm(self.config.feature_hidden_size)
 
     def _forward_g_contact(self, model_g, model_contact, x, is_g):
-        x_contact = model_contact(x)  # (bs, n_predict_frames)
-        x_g = model_g(x)  # (bs, n_predict_frames)
-
-        not_is_g = (is_g == 0)
-        x = x_contact * not_is_g + x_g * is_g  # (bs, n_predict_frames)
-        return x
+        return model_contact(x)
 
     def _forward_sep_sideend(self, x, is_g, feature):
         bs, C, seq_len, W, H = x.shape
@@ -5838,32 +5828,25 @@ if __name__ == "__main__":
     #                 calc_single_view_loss_weight=1,
     #                 )
     # main(config)
-
-    exp_name = f"3d_v{v}_63frames_predict19_usedatastep9"
-    config = Config(exp_name=exp_name, n_frames=63, seq_model="flatten",
-                    step=3, epochs=3,
-                    step_size_ratio=2.5,
-                    use_data_step=9,
-                    negative_sample_ratio_g=1,
-                    negative_sample_ratio_close=1,
-                    negative_sample_ratio_far=1,
-                    model_name="cnn_3d_r3d_18",
-                    n_predict_frames=19,
+    exp_name = f"2.5d3d_v{v}_n_frames123_resnet34"
+    config = Config(exp_name=exp_name, n_frames=123, seq_model="3dcnn_simple",
+                    model_name=f"cnn_2.5d3d_legacy_seresnet34", epochs=2, step=3,
+                    step_size_ratio=1.5,
+                    hidden_size_3d=512,
+                    weight_decay=0.1,
+                    gradient_clipping=0.2,
+                    interpolate_image=False,
+                    image_path=f"images_128x96_v{v}",
+                    criterion="bcewithlogitsloss",
+                    soft_label_range=(0.1, 0.9),
                     lr_fc=1e-3,
                     lr=1e-4,
-                    batch_size=24,
-                    interpolate_image=False,
-                    criterion="bcewithlogitsloss",
-                    transforms_train=A.Compose([
-                        A.CenterCrop(96, 96, p=1.0),
-                        A.HorizontalFlip(p=0.5),
-                    ]),
-                    transforms_eval=A.Compose([
-                        A.CenterCrop(96, 96, p=1.0),
-                    ]),
                     gk_key="game_key",
-                    pooling="maxpool",
-                    image_path=f"images_128x96_v{v}",
+                    negative_sample_ratio_g=0.1,
+                    negative_sample_ratio_close=0.3,
+                    negative_sample_ratio_far=0.3,
+                    n_predict_frames=3,
                     calc_single_view_loss_weight=1,
                     )
     main(config)
+
